@@ -9,6 +9,10 @@ import threading
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
 import datetime
+import queue
+import sys
+import sounddevice as sd
+from vosk import KaldiRecognizer, Model
 
 # ── Backend import ────────────────────────────────────────────────────────────
 import pantry_tracker as pt
@@ -28,7 +32,10 @@ CYAN       = "#8be9fd"
 FG         = "#cdd6f4"   # main text
 FG_DIM     = "#6c7086"   # muted text
 BORDER     = "#45475a"
-
+SAMPLE_RATE = 16000
+CHUNK_DURATION = 0.2  # Process audio every 200ms for rapid updates
+BLOCK_SIZE = int(SAMPLE_RATE * CHUNK_DURATION)
+audio_queue = queue.Queue()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -44,6 +51,11 @@ def _tag_color(msg: str) -> str:
     if msg.startswith("  ❌") or "error" in msg.lower():
         return "red"
     return "normal"
+
+def audio_callback(indata, frames, time, status):
+    if status:
+        print(status, file=sys.stderr)
+    audio_queue.put(indata.copy())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -124,7 +136,8 @@ class PantryApp:
         self.root.configure(bg=BG)
         self.root.geometry("960x640")
         self.root.minsize(760, 520)
-
+        self.toggle_var = tk.BooleanVar(value=False)
+        self.model = Model(lang="en-us")
         self._build_styles()
         self._build_ui()
         self._init_db()
@@ -291,6 +304,23 @@ class PantryApp:
             padx=18, pady=6,
             cursor="hand2",
         )
+        self.microphone_btn = tk.Checkbutton(
+            inp_row,
+            text="🎤",
+            variable=self.toggle_var,
+            command=self._toggle,
+            indicatoron=False,
+            bg=SURFACE,
+            fg=FG,
+            activebackground=ACCENT_HOV,
+            activeforeground="white",
+            selectcolor=SURFACE,   # Prevent white flash
+            relief="flat",
+            padx=10,
+            pady=6,
+        )
+        
+        self.microphone_btn.pack(side="left",padx=(8,0))
         self.submit_btn.pack(side="left", padx=(8, 0))
 
         # ── status bar ────────────────────────────────────────────────────────
@@ -316,6 +346,58 @@ class PantryApp:
         threading.Thread(target=_worker, daemon=True).start()
 
     # ── submit handler ────────────────────────────────────────────────────────
+
+    def _toggle(self):
+        if self.toggle_var.get():
+            self.microphone_btn.config(
+                bg=GREEN,
+                fg="black",
+                activebackground=GREEN,
+                activeforeground="black",
+            )
+
+            threading.Thread(
+                target=self._microphoneInput,
+                daemon=True
+            ).start()
+
+        else:
+            self.microphone_btn.config(
+                bg=SURFACE,
+                fg=FG,
+                activebackground=ACCENT_HOV,
+                activeforeground="white",
+            )
+
+    def _microphoneInput(self):
+        model = Model(lang="en-us")
+        recognizer = KaldiRecognizer(self.model, SAMPLE_RATE)
+
+        stream = sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            callback=audio_callback,
+            blocksize=BLOCK_SIZE,
+            dtype="int16",
+        )
+
+        with stream:
+            while self.toggle_var.get():
+
+                chunk = audio_queue.get()
+                audio_bytes = bytes(chunk)
+
+                if recognizer.AcceptWaveform(audio_bytes):
+                    result = json.loads(recognizer.Result())
+                    text = result.get("text", "")
+
+                    if text:
+                        self.root.after(
+                            0,
+                            lambda t=text: self.entry_var.set(
+                                self.entry_var.get() + " " + t
+                            )
+                        )
     def _submit(self):
         text = self.entry_var.get().strip()
         if not text:
