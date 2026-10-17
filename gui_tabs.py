@@ -522,12 +522,12 @@ class SpeechControls(tk.Frame):
         path = filedialog.askopenfilename(
             title="Choose a whisper.cpp model",
             filetypes=[("whisper.cpp model", "*.bin"), ("All files", "*.*")])
-        self._register(path)
+        self._register_model(path)
 
     def _add_folder(self):
-        self._register(filedialog.askdirectory(title="Choose a Whisper model folder"))
+        self._register_model(filedialog.askdirectory(title="Choose a Whisper model folder"))
 
-    def _register(self, path):
+    def _register_model(self, path):
         if not path:
             return
         model = stt_engine.model_from_path(path)
