@@ -1,168 +1,202 @@
-# 🥦 Pantry Tracker
+# 🥦 StockLlama
 
-Natural-language pantry inventory management powered by **Ollama** (local LLM) and **PostgreSQL**.
+Natural-language inventory management powered by **Ollama** (local LLM) and **PostgreSQL**,
+with a dark-themed desktop GUI, **voice input** (FUTO / Whisper models), **activity logging**
+and **per-ingredient charts**. Everything runs locally.
 
 ---
 
 ## Features
 
-- Parse free-form sentences like *"I bought 12 kg onions and used 5 kg garlic"*
-- Positive actions (bought / received / added) **increase** quantity
-- Negative actions (used / consumed / finished) **decrease** quantity
-- Quantities floored at **0 kg** — no negative stock ever
-- New items are **auto-created**; existing items are **upserted**
-- Optional purchase date extraction from natural language
-- Weight normalisation: grams → kg, pounds → kg
+- Parse free-form sentences like *"Bought 3 kg rice and 2 liters oil today"* into structured items
+- Review the parsed items, then **Save** or **Discard** them
+- Manual add / update / delete, search and category filter, low-stock highlighting
+- **Voice input** – dictate instead of typing; choose from FUTO ACFT, stock Whisper or your own models
+- **Logs tab** – every input with its date, prompt and resulting events
+- **Charts tab** – pick ingredients and a chart type, one combined chart or one per ingredient
+
+The window has three tabs: **📦 Inventory**, **📊 Charts**, **📋 Logs**.
 
 ---
 
-## Quick Start
+## Quick start
 
 ### 1 — Start PostgreSQL
 
-**Option A — Docker (recommended):**
 ```bash
-docker compose up -d
-```
-
-**Option B — existing Postgres:** create a database called `pantry`
-```sql
-CREATE DATABASE pantry;
+docker compose up -d          # or use an existing Postgres and edit config.py
 ```
 
 ### 2 — Install Ollama & pull a model
 
 ```bash
-# Install: https://ollama.com/download
-ollama pull llama3.2        # ~2 GB, fast and accurate enough
-# or:
-ollama pull mistral
-ollama pull qwen2.5
-```
-
-Make sure Ollama is running:
-```bash
-ollama serve        # starts on http://localhost:11434
+# https://ollama.com/download
+ollama pull tinyllama         # default in the GUI; llama3.2 / mistral / qwen2.5 also work
+ollama serve                  # http://localhost:11434
 ```
 
 ### 3 — Install Python dependencies
 
 ```bash
 pip install -r requirements.txt
+pip install matplotlib numpy sounddevice        # charts + microphone
 ```
+
+Voice recognition needs **one** of the backends below (see [Voice input](#voice-input)).
 
 ### 4 — Run
 
 ```bash
-python run.py
+python main.py
 ```
 
 ---
 
-## Configuration (environment variables)
+## Voice input
 
-| Variable        | Default       | Description              |
-|-----------------|---------------|--------------------------|
-| `DB_HOST`       | `localhost`   | Postgres host            |
-| `DB_PORT`       | `5432`        | Postgres port            |
-| `DB_NAME`       | `pantry`      | Database name            |
-| `DB_USER`       | `postgres`    | Postgres user            |
-| `DB_PASSWORD`   | `postgres`    | Postgres password        |
-| `OLLAMA_HOST`   | `http://localhost:11434` | Ollama base URL |
-| `OLLAMA_MODEL`  | `llama3.2`    | Model name to use        |
+Click **🎙 RECORD**, speak, click **■ STOP**. The transcription is placed in the input box
+(appended if text is already there) so you can correct it before pressing **PARSE WITH AI**.
+The speech model loads in the background while you are still talking.
 
-Example:
-```bash
-OLLAMA_MODEL=mistral DB_PASSWORD=secret python run.py
-```
+### Models
 
----
+| Group | Models | Backend | Install |
+|---|---|---|---|
+| **FUTO ACFT** (Whisper fine-tuned by FUTO) | tiny / base / small, English-only (`.en`) and multilingual | `transformers` | `pip install transformers torch` |
+| **Stock Whisper** | tiny.en, base.en, small.en, medium.en, small, medium, large-v3 | `faster-whisper` | `pip install faster-whisper` |
+| **Local files** | any whisper.cpp `.bin` (e.g. FUTO's GGML downloads) | `pywhispercpp` | `pip install pywhispercpp` |
+| **Local folders** | Hugging Face Whisper folder, or CTranslate2 folder | auto-detected | — |
 
-## CLI flags
+FUTO's models come from <https://github.com/futo-org/whisper-acft>; the Hub checkpoints are
+named `futo-org/acft-whisper-{tiny,base,small}[.en]` and download automatically on first use
+(~75 MB tiny, ~142 MB base, ~465 MB small). **base.en** is the default: a good speed/accuracy balance.
 
-```bash
-python run.py --setup    # create table, then exit
-python run.py --list     # print current inventory, then exit
-python run.py --reset    # drop + recreate table, then exit
-```
+**Adding your own model:** click **…** next to the model list, or drop a `.bin` file / model folder
+into `models/stt/` and restart. Any Hugging Face repo id can also be loaded from code:
+`SpeechRecognizer().load("owner/repo")`.
 
----
+**Language:** `auto` by default; pick `en`, `hi`, `kn`, `ta`, … for multilingual models.
+English-only (`.en`) models ignore this setting. Accuracy on non-English speech with tiny/base is limited.
 
-## Example session
-
-```
-You: I bought 12kg onions and 1kg tomatoes, used 5kg garlic
-
-🤖  Asking LLM… done.
-
-📝  Detected 3 operation(s):
-     • onion: +12.000 kg
-     • tomato: +1.000 kg
-     • garlic: -5.000 kg
-
-✅  Database updated:
-  🆕  onion: added 12.000 kg (new item)
-  🆕  tomato: added 1.000 kg (new item)
-  ⚠️   garlic: cannot reduce — item not found in inventory
-
-You: received 3kg garlic, used 500g tomato
-
-✅  Database updated:
-  🆕  garlic: added 3.000 kg (new item)
-  ➖  tomato: 1.000 kg → 0.500 kg
-
-You: list
-
-📦  Current Inventory:
-  Item        Qty (kg)  Last updated
-  ──────────────────────────────────
-  garlic         3.000  2024-06-01 10:05
-  onion         12.000  2024-06-01 10:04
-  tomato         0.500  2024-06-01 10:05
-```
+> **Note on FUTO's speed advantage.** FUTO's ACFT models are designed to run with whisper.cpp's
+> *dynamic audio context*, which is what makes short dictations fast on phones. The `.bin`
+> (whisper.cpp) route uses it automatically for files with `acft` in the name. Through the
+> `transformers` route the models run the normal 30 s window: they work fine, just without that speed-up.
 
 ---
 
-## How it works
+## Activity log
+
+Every input produces an entry containing:
+
+- **date** and time,
+- the **input prompt** (typed, spoken or a manual add/update/delete),
+- the **events** that followed: speech transcription, Ollama model used, raw LLM response,
+  parsed items, saved / discarded / updated / deleted, errors.
+
+Files are written to `./logs/` (override with the `STOCKLLAMA_LOG_DIR` environment variable):
+
+| File | Purpose |
+|---|---|
+| `activity.jsonl` | Machine-readable, append-only; what the Logs tab reads |
+| `activity.log` | Human-readable, rotating (1 MB × 3) |
+
+Example (`activity.log`):
 
 ```
-User input
-   │
-   ▼
-Ollama (local LLM)
-   │  Extracts: ingredient name, delta_kg (+/-), date
-   ▼
-JSON operations list
-   │
-   ▼
-PostgreSQL
-   ├─ item exists?  → UPDATE quantity_kg, last_updated
-   └─ new item?     → INSERT row
+2026-10-17 06:14:25 | [3f9a1c2e] INPUT (voice): bought 2 kg flour
+2026-10-17 06:14:25 | [3f9a1c2e]   speech: Transcribed with FUTO ACFT base.en (3.2s audio, 1.1s, language=auto)
+2026-10-17 06:14:25 | [3f9a1c2e]   model: Ollama model: tinyllama
+2026-10-17 06:14:25 | [3f9a1c2e]   parsed: 1 item(s) detected: ✓ 2.0 kg Flour [Food]
+2026-10-17 06:14:25 | [3f9a1c2e]   saved: Saved 1 item(s) to the database (ids: 5)
 ```
 
-The LLM returns a strict JSON schema:
+### Logs tab
 
-```json
-{
-  "operations": [
-    { "name": "onion",  "delta_kg":  12.0,  "purchased_at": null },
-    { "name": "tomato", "delta_kg":   1.0,  "purchased_at": null },
-    { "name": "garlic", "delta_kg":  -5.0,  "purchased_at": null }
-  ]
-}
-```
-
-The app never lets a quantity go below **0**.
+Entries are listed newest first with a colour-coded result (`saved`, `awaiting save`, `discarded`,
+`no items`, `error`, …). Select one to see its full prompt and event timeline. You can search across
+prompts and events, filter by source (`typed` / `voice` / `manual`), and **Export CSV**.
+The tab updates live as new inputs arrive.
 
 ---
 
-## Database schema
+## Charts
+
+Open the **📊 Charts** tab, then:
+
+1. **Select ingredients** in the list (multi-select; *Select all* / *Clear*).
+2. **Choose a chart type**: Line, Area, Bar or Pie.
+3. Toggle **All ingredients in one chart**: on = a single chart, off = one chart per ingredient.
+
+Charts are drawn inside the window and redraw when you change anything. **Export PNG** saves them
+(a single file, or one file per ingredient into a folder).
+
+| Type | Combined chart | Separate charts |
+|---|---|---|
+| Line / Area | Stock level over time, one line per ingredient | Stock level over time |
+| Bar | Current stock per ingredient | Daily change (green = bought, red = used) |
+| Pie | Share of current stock | Bought vs used |
+
+**How the numbers are derived.** Each row in the `inventory` table is one movement. A row with
+only `date_used` is consumption (−); anything else is a purchase / stock-in (+). The movement date
+is `date_bought`, else `date_used`, else the day the row was created. Ingredient names are grouped
+case-insensitively. Quantities in a combined chart can have different units (kg, liters, pieces);
+the axis then says *mixed units*.
+
+Separate mode shows at most 12 charts at once; narrow the selection to see others.
+
+---
+
+## Configuration
+
+| Variable / file | Description |
+|---|---|
+| `config.py` | Database, Ollama and window settings |
+| `STOCKLLAMA_LOG_DIR` | Where log files are written (default `./logs`) |
+| `models/stt/` | Drop local speech models here |
+
+---
+
+## Project layout
+
+```
+main.py            entry point
+app.py             main window: Inventory / Charts / Logs tabs
+gui_tabs.py        ChartsTab, LogsTab, SpeechControls widgets
+charts.py          chart data + matplotlib figure builders (no Tk)
+activity_log.py    activity logging (JSONL + readable log)
+stt_engine.py      speech models (FUTO / Whisper / whisper.cpp) + microphone capture
+database.py        PostgreSQL access (inventory, inventory_log)
+ollama_parser.py   LLM prompt + JSON parsing
+config.py          settings
+requirements-extra.txt   optional packages for charts and voice
+```
+
+### Database schema
 
 ```sql
-CREATE TABLE pantry_items (
-    id            SERIAL PRIMARY KEY,
-    name          TEXT    NOT NULL UNIQUE,
-    quantity_kg   NUMERIC(12, 3) NOT NULL DEFAULT 0,
-    last_updated  TIMESTAMPTZ    NOT NULL DEFAULT NOW()
+CREATE TABLE inventory (
+    id SERIAL PRIMARY KEY, item_name VARCHAR(255) NOT NULL,
+    quantity NUMERIC(10,2) NOT NULL, unit VARCHAR(50), category VARCHAR(100),
+    date_used DATE, date_bought DATE, notes TEXT, raw_input TEXT,
+    created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW()
+);
+CREATE TABLE inventory_log (
+    id SERIAL PRIMARY KEY, inventory_id INTEGER REFERENCES inventory(id) ON DELETE CASCADE,
+    action VARCHAR(50), quantity_change NUMERIC(10,2), notes TEXT,
+    logged_at TIMESTAMP DEFAULT NOW()
 );
 ```
+
+The activity log described above is separate from `inventory_log`: it lives in files and records
+*what the user typed or said and what happened next*, not just row changes.
+
+---
+
+## Troubleshooting
+
+- **"needs an extra package"** – install the pip package named in the message for that model.
+- **No microphone / `sounddevice` error** – `pip install sounddevice`; on Linux also `sudo apt install libportaudio2`.
+- **First voice use is slow** – the model is downloading; later runs use the cached copy.
+- **Charts tab says "No inventory data yet"** – add items first (or check the database connection).
+- **Ollama offline** – run `ollama serve` and `ollama pull <model>`.

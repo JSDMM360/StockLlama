@@ -1,0 +1,15 @@
+# Charts (required for the Charts tab)
+matplotlib>=3.7
+numpy
+
+# Voice input - microphone capture (required for the record button)
+sounddevice
+
+# Voice input - pick the backend(s) you want:
+# FUTO ACFT models from the Hugging Face Hub (futo-org/acft-whisper-*)
+transformers
+torch
+# Stock Whisper sizes, fast on CPU
+faster-whisper
+# whisper.cpp .bin files (e.g. downloaded from keyboard.futo.org/voice-input-models)
+pywhispercpp
