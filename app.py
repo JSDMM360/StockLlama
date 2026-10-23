@@ -15,8 +15,10 @@ from database import DatabaseManager
 from ollama_parser import OllamaParser
 from config import APP_CONFIG
 
+import bulk_parse
 from activity_log import ActivityLogger
-from gui_tabs import ChartsTab, LogsTab, SpeechControls
+from gui_tabs import (ChartsTab, LogsTab, SpeechControls, ReviewDialog,
+                      LargeInputDialog, add_text_controls)
 from predict_tab import PredictionsTab
 from stt_engine import SpeechRecognizer
 
@@ -80,6 +82,9 @@ class InventoryApp:
         self._pending_entry = None      # log entry waiting for SAVE / Discard
         self._voice_text = None         # text most recently produced by speech
         self._voice_result = None
+        self._cancel = threading.Event()    # set to stop a multi-batch parse
+        self._parse_running = False
+        self._progress_label = None
 
         self._setup_styles()
         self._build_ui()
@@ -238,9 +243,16 @@ class InventoryApp:
 
     def _build_input_panel(self, parent):
         """Build left AI input panel."""
-        tk.Label(parent, text="NATURAL LANGUAGE INPUT",
+        header = tk.Frame(parent, bg=COLORS["surface"])
+        header.pack(fill="x", padx=16, pady=(16, 4))
+        tk.Label(header, text="NATURAL LANGUAGE INPUT",
                  bg=COLORS["surface"], fg=COLORS["text_dim"],
-                 font=("Consolas", 8, "bold")).pack(anchor="w", padx=16, pady=(16, 4))
+                 font=("Consolas", 8, "bold")).pack(side="left")
+        tk.Button(header, text="✕ Clear", command=self._clear_input,
+                  bg=COLORS["surface"], fg=COLORS["text_dim"],
+                  activebackground=COLORS["surface3"], activeforeground=COLORS["text"],
+                  relief="flat", bd=0, cursor="hand2", font=("Consolas", 8, "bold"),
+                  padx=6, pady=0).pack(side="right")
 
         # Input area
         input_frame = tk.Frame(parent, bg=COLORS["surface2"],
@@ -251,18 +263,26 @@ class InventoryApp:
                                   height=4, bg=COLORS["surface2"],
                                   fg=COLORS["text"], insertbackground=COLORS["accent"],
                                   font=("Consolas", 11), relief="flat", bd=8,
-                                  wrap="word",
+                                  wrap="word", undo=True,
                                   highlightthickness=0)
         self.input_text.pack(fill="x")
-        self.input_text.insert("1.0", "e.g. Bought 3 kg rice and 2 liters oil today")
+        self.input_text.insert("1.0", self.PLACEHOLDER)
+        self.input_text.edit_reset()
         self.input_text.bind("<FocusIn>", self._clear_placeholder)
+        self.input_text.bind("<FocusOut>", self._restore_placeholder)
+        # Return parses, Shift+Return inserts a new line
         self.input_text.bind("<Return>", lambda e: self._parse_input() or "break")
+        self.input_text.bind("<Shift-Return>", lambda e: None)
+        add_text_controls(self.input_text, COLORS, on_clear=self._clear_input)
         self.input_text.configure(fg=COLORS["text_dimmer"])
 
         # Parse button
-        parse_btn = StyledButton(parent, "⚡ PARSE WITH AI",
-                                 command=self._parse_input, style="primary")
-        parse_btn.pack(fill="x", padx=16, pady=(0, 4))
+        parse_row = tk.Frame(parent, bg=COLORS["surface"])
+        parse_row.pack(fill="x", padx=16, pady=(0, 4))
+        StyledButton(parse_row, "⚡ PARSE WITH AI", command=self._parse_input,
+                     style="primary").pack(side="left", fill="x", expand=True)
+        StyledButton(parse_row, "⤢ Large…", command=self._open_large_input,
+                     style="ghost").pack(side="left", padx=(4, 0))
 
         # Voice input (model picker + record button)
         self.speech = SpeechControls(parent, self.recognizer, COLORS,
@@ -443,11 +463,29 @@ class InventoryApp:
         self.tree.tag_configure("odd", background=COLORS["surface2"])
 
     # ── Event handlers ─────────────────────────────────────────────────────────
+    PLACEHOLDER = "e.g. Bought 3 kg rice and 2 liters oil today"
+
     def _clear_placeholder(self, event):
         current = self.input_text.get("1.0", "end-1c")
         if current.startswith("e.g."):
             self.input_text.delete("1.0", "end")
+            self.input_text.edit_reset()
             self.input_text.configure(fg=COLORS["text"])
+
+    def _restore_placeholder(self, event):
+        if not self.input_text.get("1.0", "end-1c").strip():
+            self.input_text.delete("1.0", "end")
+            self.input_text.insert("1.0", self.PLACEHOLDER)
+            self.input_text.edit_reset()
+            self.input_text.configure(fg=COLORS["text_dimmer"])
+
+    def _clear_input(self):
+        """Empty the input box (Ctrl+Z brings the text back)."""
+        self.input_text.delete("1.0", "end")
+        self.input_text.configure(fg=COLORS["text"])
+        self._voice_text = None
+        self._voice_result = None
+        self.input_text.focus_set()
 
     def _on_model_change(self, event):
         model = self.model_var.get()
@@ -507,20 +545,35 @@ class InventoryApp:
             self.form_vars[var_name].set(value)
 
     def _parse_input(self):
-        """Parse natural language input using Ollama."""
+        """Parse the text in the input box."""
         text = self.input_text.get("1.0", "end-1c").strip()
         if not text or text.startswith("e.g."):
             messagebox.showwarning("Input Required", "Please enter some inventory text.")
             return
+        from_voice = bool(self._voice_text) and text == self._voice_text
+        voice_result = self._voice_result if from_voice else None
+        self._voice_text = None
+        self._voice_result = None
+        self._begin_parse(text, "voice" if from_voice else "typed", voice_result)
 
-        # ── activity log: start an entry for this prompt ──────────────────────
+    def _open_large_input(self):
+        current = self.input_text.get("1.0", "end-1c").strip()
+        if current.startswith("e.g."):
+            current = ""
+        LargeInputDialog(self.root, COLORS, on_parse=self._begin_parse, initial=current)
+
+    def _begin_parse(self, text, source="typed", voice_result=None):
+        """Log the input, then import it directly (JSON/CSV) and/or send it to the
+        model in small batches."""
+        if self._parse_running:
+            messagebox.showinfo("Busy", "Still processing the previous input. "
+                                "Cancel it or wait for it to finish.")
+            return
         if self._pending_entry:
             self.logger.event(self._pending_entry, "discarded",
                               "Replaced by a new input before saving")
             self._pending_entry = None
-        from_voice = bool(self._voice_text) and text == self._voice_text
-        voice_result = self._voice_result if from_voice else None
-        entry = self.logger.begin(text, source="voice" if from_voice else "typed")
+        entry = self.logger.begin(text, source=source)
         if voice_result:
             self.logger.event(
                 entry, "speech",
@@ -529,63 +582,161 @@ class InventoryApp:
                 f"{voice_result.elapsed_seconds:.1f}s, "
                 f"language={voice_result.language or 'auto'})")
         self.logger.event(entry, "model", f"Ollama model: {self.parser.model}")
-        self._voice_text = None
-        self._voice_result = None
 
-        self._set_ai_output("⚡ Thinking...", COLORS["warning"])
+        det = bulk_parse.analyse(text)
+        if det.kind == "bad_json":
+            msg = "Input looks like JSON but could not be read: " + det.warnings[0]
+            self.logger.event(entry, "error", msg)
+            self._set_ai_output(msg, COLORS["error"])
+            self._set_status("● Invalid JSON", COLORS["error"])
+            return
+        if det.items:
+            self.logger.event(
+                entry, "info",
+                f"Detected {det.kind.upper()} input: {len(det.items)} item(s) "
+                f"imported directly, no AI needed")
+        for w in det.warnings[:20]:
+            self.logger.event(entry, "warning", w)
+        if len(det.warnings) > 20:
+            self.logger.event(entry, "warning", f"... and {len(det.warnings) - 20} more")
+        notes = ([f"{len(det.warnings)} row(s) had problems - see the Logs tab."]
+                 if det.warnings else [])
+
+        chunks = bulk_parse.chunk_lines(det.lines)
+        if len(chunks) > 1:
+            self.logger.event(entry, "info",
+                              f"Text split into {len(chunks)} batches for the model")
+        if not chunks:
+            self._show_parsed_items(det.items, text, entry, notes=notes)
+            return
+        self._run_batches(chunks, list(det.items), text, entry, notes)
+
+    def _run_batches(self, chunks, base_items, text, entry, notes):
+        self._parse_running = True
+        self._cancel.clear()
+        total = len(chunks)
+        self._set_ai_output("⚡ Thinking..." if total == 1
+                            else f"⚡ Processing {total} batches...", COLORS["warning"])
         self._set_status("● Parsing...", COLORS["warning"])
+        self._show_progress(total)
 
         def _run():
             try:
-                accumulated = []
+                def progress(i, n):
+                    self.root.after(0, self._update_progress, i, n)
 
-                def on_chunk(token):
-                    accumulated.append(token)
-                    self.root.after(0, self._set_ai_output,
-                                    "".join(accumulated), COLORS["accent"])
+                def stream(i, n, so_far):
+                    head = f"Batch {i}/{n}\n" if n > 1 else ""
+                    self.root.after(0, self._set_ai_output, head + so_far, COLORS["accent"])
 
-                started = time.time()
-                items = self.parser.parse_input(text, on_chunk=on_chunk)
-                self.logger.event(entry, "llm_response", "".join(accumulated),
-                                  seconds=round(time.time() - started, 2))
-                for item in items:
-                    item["raw_input"] = text
-                self.root.after(0, self._show_parsed_items, items, text, entry)
+                def on_batch(i, n, chunk, raw, got, seconds, exc):
+                    prefix = f"Batch {i}/{n} ({chunk.count(chr(10)) + 1} line(s)): " if n > 1 else ""
+                    if exc is not None:
+                        self.logger.event(entry, "warning", f"{prefix}failed - {exc}",
+                                          batch=chunk[:500])
+                    else:
+                        head = f"{prefix}{len(got)} item(s)\n" if n > 1 else ""
+                        self.logger.event(entry, "llm_response", head + raw,
+                                          seconds=round(seconds, 2))
+
+                result = bulk_parse.parse_chunks(self.parser, chunks, progress,
+                                                 self._cancel, stream, on_batch)
+                self.root.after(0, self._parse_done, base_items + result.items,
+                                result, text, entry, notes)
             except ConnectionError as e:
                 self.logger.event(entry, "error", f"Ollama connection error: {e}")
-                self.root.after(0, self._set_ai_output, str(e), COLORS["error"])
-                self.root.after(0, self._set_status, "● Ollama offline", COLORS["error"])
+                self.root.after(0, self._parse_failed, str(e), "● Ollama offline")
             except Exception as e:
                 self.logger.event(entry, "error", f"Parse error: {e}")
-                self.root.after(0, self._set_ai_output,
-                                f"Parse error: {e}", COLORS["error"])
-                self.root.after(0, self._set_status, "● Error", COLORS["error"])
+                self.root.after(0, self._parse_failed, f"Parse error: {e}", "● Error")
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def _show_parsed_items(self, items: list, raw_input: str, entry=None):
-        """Show parsed items with confirm button."""
-        # Clear confirm frame
+    def _show_progress(self, total):
         for w in self.confirm_frame.winfo_children():
             w.destroy()
+        self._progress_label = tk.Label(
+            self.confirm_frame, text=f"Processing batch 0/{total}...",
+            bg=COLORS["surface"], fg=COLORS["text"], font=("Consolas", 9))
+        self._progress_label.pack(anchor="w")
+        StyledButton(self.confirm_frame, "■ Cancel", command=self._cancel_parse,
+                     style="ghost").pack(anchor="w", pady=4)
+
+    def _update_progress(self, i, n):
+        if self._progress_label is not None and self._progress_label.winfo_exists():
+            self._progress_label.configure(text=f"Processing batch {i}/{n}...")
+        self._set_status(f"● Parsing batch {i}/{n}...", COLORS["warning"])
+
+    def _cancel_parse(self):
+        self._cancel.set()
+        self._set_status("● Cancelling after this batch...", COLORS["warning"])
+
+    def _parse_failed(self, message, status):
+        self._parse_running = False
+        for w in self.confirm_frame.winfo_children():
+            w.destroy()
+        self._set_ai_output(message, COLORS["error"])
+        self._set_status(status, COLORS["error"])
+
+    def _parse_done(self, items, result, text, entry, notes):
+        self._parse_running = False
+        notes = list(notes)
+        retry = result.retry_chunks
+        if result.cancelled:
+            self.logger.event(entry, "info",
+                              "Cancelled by the user; items parsed so far are kept")
+            notes.append("Cancelled - showing the items parsed so far.")
+        if result.failures or (result.skipped and not result.cancelled):
+            self.logger.event(
+                entry, "warning",
+                f"{len(result.failures)} batch(es) failed or returned nothing, "
+                f"{len(result.skipped)} not attempted")
+            notes.append(f"{len(retry)} batch(es) failed or were not processed.")
+        self._show_parsed_items(items, text, entry, notes=notes, retry=retry)
+
+    def _retry_batches(self, chunks, items, text, entry):
+        self.logger.event(entry, "info", f"Retrying {len(chunks)} batch(es)")
+        self._run_batches(chunks, items, text, entry, [])
+
+    def _show_parsed_items(self, items: list, raw_input: str, entry=None,
+                           notes=None, retry=None):
+        """Show parsed items with confirm buttons."""
+        for w in self.confirm_frame.winfo_children():
+            w.destroy()
+        notes = notes or []
+
+        def add_notes():
+            for note in notes:
+                tk.Label(self.confirm_frame, text="⚠ " + note, bg=COLORS["surface"],
+                         fg=COLORS["warning"], font=("Consolas", 8), wraplength=290,
+                         justify="left").pack(anchor="w", pady=(2, 0))
+            if retry:
+                StyledButton(
+                    self.confirm_frame, f"↻ Retry {len(retry)} batch(es)",
+                    command=lambda: self._retry_batches(retry, items, raw_input, entry),
+                    style="ghost").pack(anchor="w", pady=4)
 
         if not items:
             self.logger.event(entry, "empty", "The model returned no items")
             self._set_ai_output("No items found. Try rephrasing.", COLORS["warning"])
+            add_notes()
             return
 
-        summary = []
-        for item in items:
-            qty = item.get("quantity", "?")
-            unit = item.get("unit") or ""
-            name = item.get("item_name", "?")
-            cat = item.get("category", "")
-            summary.append(f"  ✓ {qty} {unit} {name} [{cat}]")
+        def line(item):
+            return (f"{item.get('quantity', '?')} {item.get('unit') or ''} "
+                    f"{item.get('item_name', '?')} [{item.get('category', '')}]")
 
-        self.logger.event(
-            entry, "parsed",
-            f"{len(items)} item(s) detected:\n" + "\n".join(s.strip() for s in summary),
-            items=items)
+        shown = items[:8]
+        summary = [f"  ✓ {line(i)}" for i in shown]
+        if len(items) > len(shown):
+            summary.append(f"  … and {len(items) - len(shown)} more - press Review to see all")
+
+        log_lines = [line(i) for i in items[:30]]
+        if len(items) > 30:
+            log_lines.append(f"... and {len(items) - 30} more")
+        self.logger.event(entry, "parsed",
+                          f"{len(items)} item(s) detected:\n" + "\n".join(log_lines),
+                          items=items)
         self._pending_entry = entry
 
         self._set_ai_output("\n".join(summary), COLORS["accent2"])
@@ -598,13 +749,25 @@ class InventoryApp:
 
         btn_row = tk.Frame(self.confirm_frame, bg=COLORS["surface"])
         btn_row.pack(fill="x", pady=4)
-
         StyledButton(btn_row, "✓ SAVE ALL",
                      command=lambda: self._save_parsed_items(items),
                      style="success").pack(side="left", padx=(0, 4))
-        StyledButton(btn_row, "✗ Discard",
-                     command=self._discard_parsed,
+        StyledButton(btn_row, "👁 Review",
+                     command=lambda: self._open_review(items, entry),
+                     style="primary").pack(side="left", padx=(0, 4))
+        StyledButton(btn_row, "✗", command=self._discard_parsed,
                      style="ghost").pack(side="left")
+        add_notes()
+
+    def _open_review(self, items, entry):
+        def on_save(edited, changed):
+            if changed or len(edited) != len(items):
+                self.logger.event(
+                    entry, "info",
+                    f"Reviewed before saving: {len(items)} -> {len(edited)} item(s)"
+                    + (", some values edited" if changed else ""))
+            self._save_parsed_items(edited)
+        ReviewDialog(self.root, items, COLORS, on_save)
 
     def _discard_parsed(self):
         for w in self.confirm_frame.winfo_children():
@@ -620,22 +783,32 @@ class InventoryApp:
             self.logger.event(entry, "error", "Database not connected")
             messagebox.showerror("DB Error", "Database not connected.")
             return
+        ids = []
         try:
-            ids = [self.db.insert_item(item) for item in items]
-            count = len(items)
-            self.logger.event(
-                entry, "saved",
-                f"Saved {count} item(s) to the database (ids: "
-                f"{', '.join(str(i) for i in ids)})", ids=ids)
-            self._pending_entry = None
-            self._set_status(f"✓ Saved {count} item(s)", COLORS["accent2"])
-            for w in self.confirm_frame.winfo_children():
-                w.destroy()
-            self._refresh_table()
-            self._refresh_stats()
+            for item in items:
+                ids.append(self.db.insert_item(item))
         except Exception as e:
-            self.logger.event(entry, "error", f"Database error: {e}")
-            messagebox.showerror("DB Error", str(e))
+            self.logger.event(entry, "error",
+                              f"Database error after {len(ids)} of {len(items)} item(s): {e}")
+            messagebox.showerror(
+                "DB Error", f"{e}\n\n{len(ids)} item(s) were saved before the error; "
+                            f"{len(items) - len(ids)} were not.")
+            if ids:
+                self._refresh_table()
+                self._refresh_stats()
+                self._show_parsed_items(items[len(ids):], "", entry)
+            return
+        count = len(items)
+        id_text = (", ".join(str(i) for i in ids) if len(ids) <= 10
+                   else f"{ids[0]} to {ids[-1]}")
+        self.logger.event(entry, "saved",
+                          f"Saved {count} item(s) to the database (ids: {id_text})", ids=ids)
+        self._pending_entry = None
+        self._set_status(f"✓ Saved {count} item(s)", COLORS["accent2"])
+        for w in self.confirm_frame.winfo_children():
+            w.destroy()
+        self._refresh_table()
+        self._refresh_stats()
 
     def _manual_add(self):
         """Add item from manual form."""

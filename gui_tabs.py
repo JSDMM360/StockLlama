@@ -19,6 +19,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 from activity_log import ActivityLogger
 from charts import CHART_TYPES, build_figures, build_ingredients
+import bulk_parse
 import stt_engine
 
 FONT = "Consolas"
@@ -35,6 +36,111 @@ def _button(parent, text, command, c, kind="ghost", **kw):
                      fg=palette[1], activebackground=palette[2],
                      activeforeground=palette[1], relief="flat", bd=0,
                      cursor="hand2", font=(FONT, 9, "bold"), padx=10, pady=6, **kw)
+
+
+def add_text_controls(widget, colors, on_clear=None):
+    """Give a tk.Text the controls people expect: select all, undo/redo, delete
+    word, and a right-click menu (cut / copy / paste / delete / select all /
+    undo / redo / clear all).  Create the Text with undo=True for undo to work."""
+    clear = on_clear or (lambda: widget.delete("1.0", "end"))
+
+    def select_all(_e=None):
+        widget.tag_add("sel", "1.0", "end-1c")
+        widget.mark_set("insert", "end-1c")
+        widget.see("insert")
+        return "break"
+
+    def undo(_e=None):
+        try:
+            widget.edit_undo()
+        except tk.TclError:
+            pass
+        return "break"
+
+    def redo(_e=None):
+        try:
+            widget.edit_redo()
+        except tk.TclError:
+            pass
+        return "break"
+
+    def delete_word_back(_e=None):
+        if widget.tag_ranges("sel"):
+            widget.delete("sel.first", "sel.last")
+        else:
+            widget.delete("insert -1c wordstart", "insert")
+        return "break"
+
+    def delete_word_forward(_e=None):
+        if widget.tag_ranges("sel"):
+            widget.delete("sel.first", "sel.last")
+        else:
+            widget.delete("insert", "insert wordend")
+        return "break"
+
+    def delete_selection():
+        if widget.tag_ranges("sel"):
+            widget.delete("sel.first", "sel.last")
+
+    def delete_if_selected(_e=None):
+        """Backspace / Delete remove the whole selection wherever the cursor is
+        (Tk only does this when the cursor sits inside the selection)."""
+        if widget.tag_ranges("sel"):
+            widget.delete("sel.first", "sel.last")
+            return "break"
+        return None            # no selection: normal single-character delete
+
+    widget.bind("<BackSpace>", delete_if_selected)
+    widget.bind("<Delete>", delete_if_selected)
+
+    mods = ["Control"]
+    if widget.tk.call("tk", "windowingsystem") == "aqua":
+        mods.append("Command")
+    for mod in mods:
+        for seq, fn in ((f"<{mod}-a>", select_all), (f"<{mod}-A>", select_all),
+                        (f"<{mod}-z>", undo), (f"<{mod}-y>", redo),
+                        (f"<{mod}-Z>", redo),
+                        (f"<{mod}-BackSpace>", delete_word_back),
+                        (f"<{mod}-Delete>", delete_word_forward)):
+            widget.bind(seq, fn)
+
+    menu = tk.Menu(widget, tearoff=0, bg=colors["surface2"], fg=colors["text"],
+                   activebackground=colors["accent"], activeforeground="#0D1117",
+                   bd=0, relief="flat")
+    items = {}
+
+    def add(label, command, accel=""):
+        menu.add_command(label=label, command=command, accelerator=accel)
+        items[label] = menu.index("end")
+
+    add("Cut", lambda: widget.event_generate("<<Cut>>"), "Ctrl+X")
+    add("Copy", lambda: widget.event_generate("<<Copy>>"), "Ctrl+C")
+    add("Paste", lambda: widget.event_generate("<<Paste>>"), "Ctrl+V")
+    add("Delete selection", delete_selection, "Del")
+    menu.add_separator()
+    add("Select all", select_all, "Ctrl+A")
+    menu.add_separator()
+    add("Undo", undo, "Ctrl+Z")
+    add("Redo", redo, "Ctrl+Y")
+    menu.add_separator()
+    add("Clear all", lambda: (clear(), widget.focus_set()))
+
+    def popup(event):
+        widget.focus_set()
+        has_sel = bool(widget.tag_ranges("sel"))
+        for label in ("Cut", "Copy", "Delete selection"):
+            menu.entryconfigure(items[label], state="normal" if has_sel else "disabled")
+        menu.entryconfigure(items["Clear all"],
+                            state="normal" if widget.get("1.0", "end-1c") else "disabled")
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    for seq in ("<Button-3>", "<Button-2>", "<Control-Button-1>"):
+        widget.bind(seq, popup)
+    widget._controls_menu = menu          # exposed for tests
+    return menu
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -287,7 +393,8 @@ class LogsTab(tk.Frame):
     KIND_COLOR = {"error": "error", "saved": "success", "updated": "success",
                   "parsed": "accent", "speech": "accent4", "model": "text_dim",
                   "llm_response": "text_dim", "discarded": "warning",
-                  "deleted": "accent3", "warning": "warning", "empty": "warning"}
+                  "deleted": "accent3", "warning": "warning", "empty": "warning",
+                  "info": "text_dim"}
 
     def __init__(self, parent, logger: ActivityLogger, colors):
         super().__init__(parent, bg=colors["bg"])
@@ -314,7 +421,7 @@ class LogsTab(tk.Frame):
                  width=28).pack(side="left", padx=6)
         self.source_var = tk.StringVar(value="All")
         src = ttk.Combobox(bar, textvariable=self.source_var, state="readonly",
-                           values=["All", "typed", "voice", "manual"], width=9,
+                           values=["All", "typed", "voice", "file", "manual"], width=9,
                            font=(FONT, 9))
         src.pack(side="left", padx=4)
         src.bind("<<ComboboxSelected>>", lambda _e: self.refresh())
@@ -394,7 +501,7 @@ class LogsTab(tk.Frame):
         for e in entries:
             self.tree.insert("", "end", iid=e["id"], tags=(e["status"],), values=(
                 e["timestamp"].replace("T", " "), e["source"], e["status"],
-                e["prompt"].replace("\n", " "), len(e["events"])))
+                e["prompt"].replace("\n", " ")[:200], len(e["events"])))
         self.count_label.configure(text=f"{len(entries)} entr{'y' if len(entries) == 1 else 'ies'}")
         if selected and selected[0] in self._entries:
             self.tree.selection_set(selected[0])
@@ -618,3 +725,238 @@ class SpeechControls(tk.Frame):
 
     def _status(self, text, colour_key):
         self.status.configure(text=text, fg=self.c.get(colour_key, self.c["text_dim"]))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Review table (check / fix many parsed items before saving)
+# ══════════════════════════════════════════════════════════════════════════════
+class ReviewDialog(tk.Toplevel):
+    COLS = (("item_name", "Item", 170), ("quantity", "Qty", 70), ("unit", "Unit", 80),
+            ("category", "Category", 100), ("date_bought", "Bought", 95),
+            ("date_used", "Used", 95), ("notes", "Notes", 170))
+
+    def __init__(self, parent, items, colors, on_save):
+        """on_save(items, changed) is called with the remaining, edited items."""
+        super().__init__(parent)
+        self.c = colors
+        self.on_save = on_save
+        self.items = [dict(i) for i in items]
+        self.changed = False
+        self.title("Review parsed items")
+        self.geometry("980x580")
+        self.configure(bg=colors["bg"])
+        self.transient(parent)
+
+        tk.Label(self, text="Double-click a cell to edit  ·  select rows and press Delete "
+                            "to remove them  ·  nothing is saved until you press SAVE",
+                 bg=colors["bg"], fg=colors["text_dim"], font=(FONT, 9)).pack(
+            anchor="w", padx=14, pady=(12, 6))
+
+        frame = tk.Frame(self, bg=colors["surface"])
+        frame.pack(fill="both", expand=True, padx=14)
+        self.tree = ttk.Treeview(frame, columns=[k for k, _, _ in self.COLS],
+                                 show="headings", selectmode="extended")
+        for key, title, width in self.COLS:
+            self.tree.heading(key, text=title)
+            self.tree.column(key, width=width, minwidth=50,
+                             anchor="e" if key == "quantity" else "w")
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self.tree.pack(fill="both", expand=True)
+        self.tree.bind("<Double-1>", self._edit_cell)
+        self.tree.bind("<Delete>", lambda _e: self._remove())
+
+        bar = tk.Frame(self, bg=colors["bg"])
+        bar.pack(fill="x", padx=14, pady=12)
+        _button(bar, "🗑 Remove selected", self._remove, colors).pack(side="left")
+        self.count = tk.Label(bar, text="", bg=colors["bg"], fg=colors["text_dim"],
+                              font=(FONT, 9))
+        self.count.pack(side="left", padx=12)
+        _button(bar, "Cancel", self.destroy, colors).pack(side="right")
+        self.save_btn = _button(bar, "", self._save, colors, "success")
+        self.save_btn.pack(side="right", padx=8)
+
+        self._fill()
+        try:
+            self.wait_visibility()
+            self.grab_set()
+        except tk.TclError:
+            pass
+
+    def _values(self, item):
+        return tuple("" if item.get(k) is None else item.get(k) for k, _, _ in self.COLS)
+
+    def _fill(self):
+        self.tree.delete(*self.tree.get_children())
+        for i, item in enumerate(self.items):
+            self.tree.insert("", "end", iid=str(i), values=self._values(item))
+        n = len(self.items)
+        self.save_btn.configure(text=f"✓ SAVE {n} ITEM{'S' if n != 1 else ''}",
+                                state="normal" if n else "disabled")
+        self.count.configure(text=f"{n} item(s)")
+
+    def _remove(self):
+        sel = {int(i) for i in self.tree.selection()}
+        if not sel:
+            return
+        self.items = [it for n, it in enumerate(self.items) if n not in sel]
+        self.changed = True
+        self._fill()
+
+    def _edit_cell(self, event):
+        if self.tree.identify("region", event.x, event.y) != "cell":
+            return
+        iid = self.tree.identify_row(event.y)
+        col = self.tree.identify_column(event.x)
+        if not iid:
+            return
+        key = self.COLS[int(col[1:]) - 1][0]
+        x, y, w, h = self.tree.bbox(iid, col)
+        entry = tk.Entry(self.tree, bg=self.c["surface2"], fg=self.c["text"],
+                         insertbackground=self.c["accent"], relief="flat",
+                         font=(FONT, 10), highlightthickness=1,
+                         highlightbackground=self.c["accent"])
+        current = self.items[int(iid)].get(key)
+        entry.insert(0, "" if current is None else str(current))
+        entry.select_range(0, "end")
+        entry.place(x=x, y=y, width=w, height=h)
+        entry.focus_set()
+        done = [False]
+
+        def finish(commit):
+            if done[0]:
+                return
+            done[0] = True
+            value = entry.get().strip()
+            entry.destroy()
+            if commit:
+                self._apply(int(iid), key, value)
+
+        entry.bind("<Return>", lambda _e: finish(True))
+        entry.bind("<FocusOut>", lambda _e: finish(True))
+        entry.bind("<Escape>", lambda _e: finish(False))
+
+    def _apply(self, idx, key, value):
+        item = self.items[idx]
+        try:
+            if key == "quantity":
+                new = float(value.replace(",", ""))
+            elif key in ("date_bought", "date_used"):
+                new = bulk_parse.parse_date(value) if value else None
+            elif key == "item_name":
+                if not value:
+                    raise ValueError
+                new = value
+            elif key == "category":
+                new = value or "General"
+            else:
+                new = value or None
+        except ValueError:
+            self.bell()
+            return
+        if item.get(key) != new:
+            item[key] = new
+            self.changed = True
+            self.tree.item(str(idx), values=self._values(item))
+
+    def _save(self):
+        items, changed = self.items, self.changed
+        self.destroy()
+        self.on_save(items, changed)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Large input window
+# ══════════════════════════════════════════════════════════════════════════════
+class LargeInputDialog(tk.Toplevel):
+    def __init__(self, parent, colors, on_parse, initial=""):
+        """on_parse(text, source) is called with the text and 'typed' or 'file'."""
+        super().__init__(parent)
+        self.c = colors
+        self.on_parse = on_parse
+        self._loaded_text = None
+        self._job = None
+        self.title("Large input")
+        self.geometry("920x660")
+        self.configure(bg=colors["bg"])
+        self.transient(parent)
+
+        tk.Label(self, text="Paste a long list, JSON or CSV - or open a file. JSON and CSV "
+                            "are imported directly; plain text is sent to the AI in small batches.",
+                 bg=colors["bg"], fg=colors["text_dim"], font=(FONT, 9),
+                 wraplength=880, justify="left").pack(anchor="w", padx=14, pady=(12, 6))
+
+        bar = tk.Frame(self, bg=colors["bg"])
+        bar.pack(fill="x", padx=14)
+        _button(bar, "📂 Open file…", self._open, colors).pack(side="left")
+        _button(bar, "Clear", lambda: self.text.delete("1.0", "end"), colors).pack(
+            side="left", padx=6)
+
+        box = tk.Frame(self, bg=colors["surface2"], highlightthickness=1,
+                       highlightbackground=colors["border"])
+        box.pack(fill="both", expand=True, padx=14, pady=10)
+        self.text = tk.Text(box, bg=colors["surface2"], fg=colors["text"],
+                            insertbackground=colors["accent"], font=(FONT, 10),
+                            relief="flat", bd=8, wrap="none", undo=True,
+                            highlightthickness=0)
+        add_text_controls(self.text, colors)
+        vsb = ttk.Scrollbar(box, orient="vertical", command=self.text.yview)
+        hsb = ttk.Scrollbar(box, orient="horizontal", command=self.text.xview)
+        self.text.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        vsb.pack(side="right", fill="y")
+        hsb.pack(side="bottom", fill="x")
+        self.text.pack(fill="both", expand=True)
+
+        self.info = tk.Label(self, text="", bg=colors["bg"], fg=colors["accent"],
+                             font=(FONT, 9, "bold"), wraplength=880, justify="left",
+                             anchor="w")
+        self.info.pack(fill="x", padx=14)
+        row = tk.Frame(self, bg=colors["bg"])
+        row.pack(fill="x", padx=14, pady=12)
+        _button(row, "Close", self.destroy, colors).pack(side="right")
+        _button(row, "⚡ PARSE", self._parse, colors, "primary").pack(side="right", padx=8)
+
+        if initial:
+            self.text.insert("1.0", initial)
+        self.text.edit_modified(False)
+        self.text.bind("<<Modified>>", self._on_modified)
+        self._update_info()
+        self.text.focus_set()
+
+    def _on_modified(self, _event):
+        if self.text.edit_modified():
+            self.text.edit_modified(False)
+            if self._job:
+                self.after_cancel(self._job)
+            self._job = self.after(300, self._update_info)
+
+    def _update_info(self):
+        self._job = None
+        det = bulk_parse.analyse(self.text.get("1.0", "end-1c"))
+        colour = {"bad_json": "error", "empty": "text_dim"}.get(det.kind, "accent")
+        self.info.configure(text=bulk_parse.describe(det), fg=self.c[colour])
+
+    def _open(self):
+        path = filedialog.askopenfilename(
+            parent=self, filetypes=[("Data / text", "*.json *.csv *.tsv *.txt"),
+                                    ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8-sig", errors="replace") as fh:
+                content = fh.read()
+        except OSError as exc:
+            messagebox.showerror("Open file", str(exc), parent=self)
+            return
+        self.text.delete("1.0", "end")
+        self.text.insert("1.0", content)
+        self._loaded_text = content.strip()
+
+    def _parse(self):
+        text = self.text.get("1.0", "end-1c").strip()
+        if not text:
+            return
+        source = "file" if text == self._loaded_text else "typed"
+        self.destroy()
+        self.on_parse(text, source)

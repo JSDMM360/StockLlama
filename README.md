@@ -10,6 +10,7 @@ and **per-ingredient charts**. Everything runs locally.
 
 - Parse free-form sentences like *"Bought 3 kg rice and 2 liters oil today"* into structured items
 - Review the parsed items, then **Save** or **Discard** them
+- **Large inputs** – paste 100+ items as JSON, CSV or plain text; no more "only the first 3 were processed"
 - Manual add / update / delete, search and category filter, low-stock highlighting
 - **Voice input** – dictate instead of typing; choose from FUTO ACFT, stock Whisper or your own models
 - **Logs tab** – every input with its date, prompt and resulting events
@@ -50,6 +51,74 @@ Voice recognition needs **one** of the backends below (see [Voice input](#voice-
 ```bash
 python main.py
 ```
+
+---
+
+## Input box controls
+
+The input box (and the Large input window) supports:
+
+| Action | How |
+|---|---|
+| Clear everything | **✕ Clear** button above the box, or right-click → *Clear all* (Ctrl+Z brings it back) |
+| Clear part of the text | Select it with the mouse or Shift+arrows, then **Backspace** / **Delete** (or right-click → *Delete selection*) |
+| Select all | **Ctrl+A** |
+| Undo / redo | **Ctrl+Z** / **Ctrl+Y** (or Ctrl+Shift+Z) |
+| Delete a word | **Ctrl+Backspace** (before the cursor) / **Ctrl+Delete** (after it) |
+| Cut / copy / paste | **Ctrl+X** / **Ctrl+C** / **Ctrl+V** or the right-click menu |
+| New line | **Shift+Enter** |
+| Parse | **Enter** |
+
+On macOS the Command key works in place of Ctrl. If the box is left empty it shows the example text again.
+
+---
+
+## Large inputs
+
+A small local model cannot turn 100 items into 100 JSON objects in one prompt: the input overflows its
+context window and it stops after a few items. StockLlama therefore handles big inputs differently:
+
+| Input | What happens |
+|---|---|
+| **JSON** (list, JSON lines, `{"Rice": "3 kg"}` mapping, or JSON pasted inside other text) | Imported **directly, with no AI**. Exact and instant. |
+| **CSV / TSV** with a header row | Imported directly, same as JSON. |
+| **Plain text** (many lines, bullets, long comma lists) | Split into batches of up to 8 lines, sent to the model one batch at a time, then merged. |
+| One short sentence | Sent to the model as before. |
+
+Click **⤢ Large…** (next to *Parse with AI*) for a big editor window. You can paste, or **Open file…**
+(`.json`, `.csv`, `.tsv`, `.txt`), and it tells you before you parse what it detected, for example
+*"JSON detected: 100 item(s) will be imported directly"* or *"250 text lines -> 32 AI batches"*.
+Pasting into the normal input box works the same way.
+
+**While batches run** you see *Processing batch 3/12* and can press **■ Cancel** (it stops after the
+current batch and keeps what was parsed). If some batches fail or return nothing, the rest are kept
+and **↻ Retry** re-runs only the failed ones. If Ollama goes down mid-way, the unprocessed batches
+can be retried once it is back.
+
+**Review before saving.** The confirm area shows the first 8 items; **👁 Review** opens a table of all of
+them. Double-click a cell to fix it, select rows and press Delete to drop them, then save. Nothing is
+written to the database until you save.
+
+**Accepted field names** (case-insensitive) for JSON/CSV:
+
+| Field | Also accepted as |
+|---|---|
+| `item_name` | `name`, `item`, `product`, `ingredient`, `title`, `description` |
+| `quantity` | `qty`, `amount`, `count`, `number` (`"3 kg"` also sets the unit) |
+| `unit` | `uom`, `measure` |
+| `category` | `cat`, `group` |
+| `date_bought` | `bought`, `purchased`, `date_purchased`, `purchase_date` |
+| `date_used` | `used`, `used_on`, `date_consumed` |
+| `notes` | `note`, `remarks`, `comment` |
+| `date` + `action` | a generic `date` is a *use* if `action`/`type` says used/consumed/issued/sold/out, otherwise a purchase |
+
+Dates may be `YYYY-MM-DD` or day-first (`16/10/2026`, `16-10-2026`, `16 Oct 2026`), or `today` / `yesterday`.
+Rows with no name are skipped; a missing quantity becomes 1; unreadable dates are left empty. Every such
+problem is listed in the Logs tab for that input.
+
+**Limits.** Batches are processed independently, so context from one line does not carry to the next
+(for example a trailing *"all bought yesterday"* applies only to its own batch). Put the date on each
+line or use JSON/CSV for big imports. Each batch still depends on the model's accuracy: use Review.
 
 ---
 
@@ -165,7 +234,7 @@ Example (`activity.log`):
 
 Entries are listed newest first with a colour-coded result (`saved`, `awaiting save`, `discarded`,
 `no items`, `error`, …). Select one to see its full prompt and event timeline. You can search across
-prompts and events, filter by source (`typed` / `voice` / `manual`), and **Export CSV**.
+prompts and events, filter by source (`typed` / `voice` / `file` / `manual`), and **Export CSV**.
 The tab updates live as new inputs arrive.
 
 ---
@@ -220,6 +289,7 @@ activity_log.py    activity logging (JSONL + readable log)
 stt_engine.py      speech models (FUTO / Whisper / whisper.cpp) + microphone capture
 database.py        PostgreSQL access (inventory, inventory_log)
 ollama_parser.py   LLM prompt + JSON parsing
+bulk_parse.py      JSON/CSV direct import, text batching, batched parsing (no Tk)
 config.py          settings
 requirements-extra.txt   optional packages for charts and voice
 ```

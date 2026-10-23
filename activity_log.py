@@ -66,8 +66,10 @@ class ActivityLogger:
         entry_id = uuid.uuid4().hex[:8]
         self._write({"type": "input", "id": entry_id, "ts": _now(),
                      "source": source, "prompt": prompt, "meta": meta})
-        self._text.info("[%s] INPUT (%s): %s", entry_id, source,
-                        prompt.replace("\n", " / "))
+        short = prompt.replace("\n", " / ")
+        if len(short) > MAX_TEXT_MESSAGE:
+            short = f"{short[:MAX_TEXT_MESSAGE]} ... [{len(prompt)} characters]"
+        self._text.info("[%s] INPUT (%s): %s", entry_id, source, short)
         self._notify(entry_id)
         return entry_id
 
