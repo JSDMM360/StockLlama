@@ -2,7 +2,7 @@
 Main GUI Application for AI Inventory Tracker
 Modern dark-themed UI using tkinter + ttk
 
-Tabs: Inventory | Charts | Logs
+Tabs: Inventory | Charts | Predictions | Logs
 """
 
 import tkinter as tk
@@ -17,6 +17,7 @@ from config import APP_CONFIG
 
 from activity_log import ActivityLogger
 from gui_tabs import ChartsTab, LogsTab, SpeechControls
+from predict_tab import PredictionsTab
 from stt_engine import SpeechRecognizer
 
 # ── Color Palette ─────────────────────────────────────────────────────────────
@@ -209,15 +210,17 @@ class InventoryApp:
         self.model_combo.pack(side="left", padx=4)
         self.model_combo.bind("<<ComboboxSelected>>", self._on_model_change)
 
-        # ── Tabs: Inventory | Charts | Logs ───────────────────────────────────
+        # ── Tabs: Inventory | Charts | Predictions | Logs ───────────────────────────────────
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill="both", expand=True)
 
         main = tk.Frame(self.notebook, bg=COLORS["bg"])           # Inventory tab
         self.charts_tab = ChartsTab(self.notebook, self._all_rows, COLORS)
+        self.predict_tab = PredictionsTab(self.notebook, self._all_rows, COLORS)
         self.logs_tab = LogsTab(self.notebook, self.logger, COLORS)
         self.notebook.add(main, text="  📦 Inventory  ")
         self.notebook.add(self.charts_tab, text="  📊 Charts  ")
+        self.notebook.add(self.predict_tab, text="  🔮 Predictions  ")
         self.notebook.add(self.logs_tab, text="  📋 Logs  ")
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
@@ -452,8 +455,11 @@ class InventoryApp:
         self._set_status(f"Model: {model}", COLORS["accent2"])
 
     def _on_tab_changed(self, _event):
-        if self.notebook.select() == str(self.charts_tab):
+        current = self.notebook.select()
+        if current == str(self.charts_tab):
             self.charts_tab.on_show()
+        elif current == str(self.predict_tab):
+            self.predict_tab.on_show()
 
     def _all_rows(self):
         """Every inventory row (used by the Charts tab)."""
@@ -796,6 +802,7 @@ class InventoryApp:
         except Exception:
             pass
         self.charts_tab.mark_dirty()
+        self.predict_tab.mark_dirty()
 
     # ── Helpers ────────────────────────────────────────────────────────────────
     def _set_status(self, text: str, color: str):

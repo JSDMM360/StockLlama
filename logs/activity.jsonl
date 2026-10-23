@@ -1,0 +1,4 @@
+{"type": "input", "id": "0cbf1bb2", "ts": "2026-10-17T12:15:57", "source": "voice", "prompt": "I went to the shop and got 10 kilograms of tomatoes and I bought 15 kilograms of potatoes.", "meta": {}}
+{"type": "event", "id": "0cbf1bb2", "ts": "2026-10-17T12:15:57", "kind": "speech", "message": "Transcribed with FUTO ACFT  base.en  (English) (6.7s audio, 0.5s, language=auto)", "data": {}}
+{"type": "event", "id": "0cbf1bb2", "ts": "2026-10-17T12:15:57", "kind": "model", "message": "Ollama model: qwen2.5:latest", "data": {}}
+{"type": "event", "id": "0cbf1bb2", "ts": "2026-10-17T12:16:57", "kind": "error", "message": "Parse error: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)", "data": {}}

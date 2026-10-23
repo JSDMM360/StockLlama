@@ -1,0 +1,4 @@
+2026-10-17 12:15:57,902 | [0cbf1bb2] INPUT (voice): I went to the shop and got 10 kilograms of tomatoes and I bought 15 kilograms of potatoes.
+2026-10-17 12:15:57,903 | [0cbf1bb2]   speech: Transcribed with FUTO ACFT  base.en  (English) (6.7s audio, 0.5s, language=auto)
+2026-10-17 12:15:57,903 | [0cbf1bb2]   model: Ollama model: qwen2.5:latest
+2026-10-17 12:16:57,968 | [0cbf1bb2]   error: Parse error: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)

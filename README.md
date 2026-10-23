@@ -14,8 +14,9 @@ and **per-ingredient charts**. Everything runs locally.
 - **Voice input** – dictate instead of typing; choose from FUTO ACFT, stock Whisper or your own models
 - **Logs tab** – every input with its date, prompt and resulting events
 - **Charts tab** – pick ingredients and a chart type, one combined chart or one per ingredient
+- **Predictions tab** – which ingredient will be used next, when, and when stock runs out
 
-The window has three tabs: **📦 Inventory**, **📊 Charts**, **📋 Logs**.
+The window has four tabs: **📦 Inventory**, **📊 Charts**, **🔮 Predictions**, **📋 Logs**.
 
 ---
 
@@ -82,6 +83,55 @@ English-only (`.en`) models ignore this setting. Accuracy on non-English speech 
 > *dynamic audio context*, which is what makes short dictations fast on phones. The `.bin`
 > (whisper.cpp) route uses it automatically for files with `acft` in the name. Through the
 > `transformers` route the models run the normal 30 s window: they work fine, just without that speed-up.
+
+---
+
+## Predictions
+
+The **🔮 Predictions** tab learns each ingredient's usage pattern from your history and answers:
+
+- **Which ingredient will be used next, and when?** (*Next use* column, plus a *Chance* that it is used within the window you pick: 3 / 7 / 14 / 30 days)
+- **When will the stock run out?** (*Runs out* date and a *Days left* range)
+- **Should I reorder?** (*Advice*: Reorder now / Reorder soon / OK / Out of stock / Possibly inactive)
+
+Sort by *Next use*, *Runs out first* or *Most likely*. Set the **reorder lead time** (days your supplier needs)
+and the advice adapts. Select a row for a plain-language explanation and a chart of past stock with the
+projected stock, the likely range, the next expected use and the "reorder by" date.
+
+**How it works** (simple and explainable, no training step):
+
+| Quantity | Method |
+|---|---|
+| Typical gap | median days between usage days (last 10 usage days only, so it follows changing habits) |
+| Consumption per day | quantity used ÷ days elapsed over that window |
+| Next use | last use + typical gap (shown as "today" if overdue) |
+| Chance in N days | of the past gaps still "open", the share that ended within N days (smoothed, never 0% or 100%) |
+| Run-out range | current stock ÷ fast (75th percentile) and slow (25th percentile) consumption rates |
+| Confidence | few records = low, 6+ = medium, 10+ = high; one level lower if the gaps are very irregular |
+
+**Self-check.** The tab back-tests itself on your own history: it predicts each past usage date from the
+ones before it and reports the average error in days. Ingredients need 4+ usage days for this.
+
+**Limits to know about**
+
+- An ingredient needs at least **3 usage days** before it is predicted; otherwise it shows *Not enough data*.
+- Only *current stock* is projected; future purchases are not assumed.
+- Forecasts are only as good as the data: a usage must be recorded as **used** (a `date_used`), see below.
+- It is a statistical heuristic, not a trained machine-learning model.
+
+### Recording usage so predictions work
+
+An entry counts as usage only if it has a `date_used` and no `date_bought`. If the LLM leaves both dates empty
+(e.g. *"used 2 kg rice"* with no date), it is treated as a purchase. Add these rules to `SYSTEM_PROMPT`
+in `ollama_parser.py` so dates are always filled:
+
+```
+- If the text says an item was used, consumed, finished or cooked, put the date in date_used and leave date_bought null. If no date is given, use today's date: {today}
+- If the text says an item was bought, purchased, received or restocked, put the date in date_bought. If no date is given, use today's date: {today}
+- Never fill both date_used and date_bought for the same item
+```
+
+Small models such as tinyllama sometimes ignore rules like these, so check the parsed items before pressing SAVE ALL.
 
 ---
 
@@ -161,8 +211,10 @@ Separate mode shows at most 12 charts at once; narrow the selection to see other
 
 ```
 main.py            entry point
-app.py             main window: Inventory / Charts / Logs tabs
+app.py             main window: Inventory / Charts / Predictions / Logs tabs
 gui_tabs.py        ChartsTab, LogsTab, SpeechControls widgets
+predict_tab.py     PredictionsTab widget
+predictions.py     forecasting logic, back-test, forecast chart (no Tk)
 charts.py          chart data + matplotlib figure builders (no Tk)
 activity_log.py    activity logging (JSONL + readable log)
 stt_engine.py      speech models (FUTO / Whisper / whisper.cpp) + microphone capture
