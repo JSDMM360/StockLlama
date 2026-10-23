@@ -73,3 +73,32 @@
 2026-10-23 08:48:24,372 | [745e37ce]   warning: ... and 80 more
 2026-10-23 08:48:24,372 | [745e37ce]   parsed: 100 item(s) detected: / 1.0  Green Tea Leaves [General] / 1.0  Oolong Tea [General] / 1.0  Chamomile Flowers [General] / 1.0  Peppermint Leaves [General] / 1.0  Hibiscus Petals [General] / 1.0  Instant Coffee [General] / 1.0  Espresso Grind Coffee [General] / 1.0  Caffeine-Free Coffee [General] / 1.0  Malted Milk Powder [General] / 1.0  Hot Cocoa Mix [General] / 1.0  Marshmallows [General] / 1.0  Rice Flour [General] / 1.0  Chickpea Flour [General] / 1.0  Buckwheat Flour [General] / 1.0  Rye Flour [General] / 1.0  Spelt Flour [General] / 1.0  Coconut Flour [General] / 1.0  Almond Flour [Genera ...
 2026-10-23 08:48:26,999 | [745e37ce]   saved: Saved 100 item(s) to the database (ids: 120 to 219)
+2026-10-23 09:52:18,108 | [51c7f89a] INPUT (typed): yesterday, I used up 500 grams of dry yeast
+2026-10-23 09:52:18,111 | [51c7f89a]   model: Ollama model: qwen2.5:latest
+2026-10-23 09:52:43,477 | [51c7f89a]   llm_response: { /     "item_name": "Dry Yeast", /     "quantity": 500, /     "unit": "grams", /     "category": "Food", /     "date_bought": null, /     "date_used": "2026-10-22", /     "notes": null / }
+2026-10-23 09:52:43,478 | [51c7f89a]   parsed: 1 item(s) detected: / 500.0 grams Dry Yeast [Food]
+2026-10-23 09:52:46,810 | [51c7f89a]   saved: Saved 1 item(s) to the database (ids: 220)
+2026-10-23 09:52:56,846 | [8442eeab] INPUT (typed): yesterday, I used up 500 grams of active dry yeast
+2026-10-23 09:52:56,847 | [8442eeab]   model: Ollama model: qwen2.5:latest
+2026-10-23 09:53:28,979 | [8442eeab]   llm_response: { /     "item_name": "Active Dry Yeast", /     "quantity": 500, /     "unit": "grams", /     "category": "Food", /     "date_bought": null, /     "date_used": "2026-10-22", /     "notes": null / }
+2026-10-23 09:53:28,979 | [8442eeab]   parsed: 1 item(s) detected: / 500.0 grams Active Dry Yeast [Food]
+2026-10-23 09:53:31,958 | [8442eeab]   saved: Saved 1 item(s) to the database (ids: 221)
+2026-10-23 09:54:28,054 | [e11b6197] INPUT (typed): yesterday, I used up 250 grams of active dry yeast
+2026-10-23 09:54:28,055 | [e11b6197]   model: Ollama model: qwen2.5:latest
+2026-10-23 09:54:54,645 | [e11b6197]   llm_response: { /     "item_name": "Active Dry Yeast", /     "quantity": 250, /     "unit": "grams", /     "category": "Food", /     "date_bought": null, /     "date_used": "2026-10-22", /     "notes": null / }
+2026-10-23 09:54:54,645 | [e11b6197]   parsed: 1 item(s) detected: / 250.0 grams Active Dry Yeast [Food]
+2026-10-23 09:54:56,535 | [e11b6197]   saved: Saved 1 item(s) to the database (ids: 222)
+2026-10-23 10:16:56,549 | [4df476ac] INPUT (typed): I have removed 250 grams of active dried yeast
+2026-10-23 10:16:56,550 | [4df476ac]   model: Ollama model: qwen3:14b
+2026-10-23 10:17:13,345 | [4df476ac]   llm_response: {}
+2026-10-23 10:17:13,346 | [4df476ac]   empty: The model returned no items
+2026-10-23 10:17:26,092 | [a8cf4b10] INPUT (typed): I have removed 250 grams of active dried yeast
+2026-10-23 10:17:26,092 | [a8cf4b10]   model: Ollama model: gemma2:2B
+2026-10-23 10:17:58,489 | [a8cf4b10]   llm_response: {"item_name": "active dried yeast", "quantity": 250, "unit": "grams", "category": "Food", "date_used": null, "date_bought": null, "notes": null}
+2026-10-23 10:17:58,489 | [a8cf4b10]   parsed: 1 item(s) detected: / 250.0 grams active dried yeast [Food]
+2026-10-23 10:18:03,027 | [a8cf4b10]   saved: Saved 1 item(s) to the database (ids: 223)
+2026-10-23 10:18:22,148 | [8ad22c58] INPUT (typed): I have removed 250 grams of active dry yeast
+2026-10-23 10:18:22,148 | [8ad22c58]   model: Ollama model: gemma2:2B
+2026-10-23 10:18:31,573 | [8ad22c58]   llm_response: {"item_name": "active dry yeast", "quantity": 250, "unit": "grams", "category": "Food", "date_used": null, "date_bought": null, "notes": null}
+2026-10-23 10:18:31,573 | [8ad22c58]   parsed: 1 item(s) detected: / 250.0 grams active dry yeast [Food]
+2026-10-23 10:18:48,588 | [8ad22c58]   saved: Saved 1 item(s) to the database (ids: 224)

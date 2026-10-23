@@ -4,19 +4,19 @@ Pantry Tracker — Tkinter GUI
 Run with: python pantry_gui.py
 """
 
-import json
-import threading
-import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
 import datetime
+import json
 import queue
 import sys
+import threading
+import tkinter as tk
+from tkinter import messagebox, scrolledtext, ttk
+
 import sounddevice as sd
 from vosk import KaldiRecognizer, Model
 
 # ── Backend import ────────────────────────────────────────────────────────────
 import pantry_tracker as pt
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Colour palette

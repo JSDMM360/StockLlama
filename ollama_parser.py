@@ -3,10 +3,11 @@ Ollama integration for parsing natural language inventory input
 """
 
 import json
-import requests
 from datetime import datetime
-from config import OLLAMA_CONFIG
 
+import requests
+
+from config import OLLAMA_CONFIG
 
 SYSTEM_PROMPT = """You are an inventory tracking assistant. Extract structured data from natural language input.
 
@@ -18,9 +19,7 @@ Given user input about items, quantities, and dates, extract:
 - date_used: date the item was used (ISO format YYYY-MM-DD or null)
 - date_bought: date the item was bought/purchased (ISO format YYYY-MM-DD or null)
 - notes: any additional context (string or null)
-- If the text says an item was used, consumed, finished or cooked, put the date in date_used and leave date_bought null. If no date is given, use today's date: {today}
-- If the text says an item was bought, purchased, received or restocked, put the date in date_bought. If no date is given, use today's date: {today}
-- Never fill both date_used and date_bought for the same item
+
 
 Rules:
 - If no unit mentioned, infer from context or use "pieces"
