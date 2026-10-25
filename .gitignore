@@ -1,0 +1,3 @@
+# Local settings (contains the database password)
+settings.json
+settings.json.tmp

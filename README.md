@@ -1,324 +1,534 @@
-# 🥦 StockLlama
+# 🦙 StockLlama
 
-Natural-language inventory management powered by **Ollama** (local LLM) and **PostgreSQL**,
-with a dark-themed desktop GUI, **voice input** (FUTO / Whisper models), **activity logging**
-and **per-ingredient charts**. Everything runs locally.
+Natural-language inventory management powered by **Ollama** (a local LLM) and **PostgreSQL**.
+Nothing leaves your machine: the language model runs locally and the data lives in your own database.
 
----
+The repository contains two applications that share the same idea (type what happened, let the
+model understand it, let ordinary code update the database):
 
-## Features
+| App | What it is | Start it with |
+|-----|------------|---------------|
+| **AI Inventory Tracker** | Desktop GUI (Tkinter) for general inventory: any item, any unit, categories, dates, search, sorting, charts of stats | `python main.py` |
+| **Pantry Tracker** | Kilogram-based pantry tracker, as a command-line program and a small GUI | `python run.py` / `python pantry_gui.py` |
 
-- Parse free-form sentences like *"Bought 3 kg rice and 2 liters oil today"* into structured items
-- Review the parsed items, then **Save** or **Discard** them
-- **Large inputs** – paste 100+ items as JSON, CSV or plain text; no more "only the first 3 were processed"
-- Manual add / update / delete, search and category filter, low-stock highlighting
-- **Voice input** – dictate instead of typing; choose from FUTO ACFT, stock Whisper or your own models
-- **Logs tab** – every input with its date, prompt and resulting events
-- **Charts tab** – pick ingredients and a chart type, one combined chart or one per ingredient
-- **Predictions tab** – which ingredient will be used next, when, and when stock runs out
-
-The window has four tabs: **📦 Inventory**, **📊 Charts**, **🔮 Predictions**, **📋 Logs**.
+> A file-by-file explanation of the code is in **[docs/CODE_GUIDE.md](docs/CODE_GUIDE.md)**.
 
 ---
 
-## Quick start
+## Table of contents
 
-### 1 — Start PostgreSQL
+1. [What's new](#whats-new)
+2. [AI Inventory Tracker](#ai-inventory-tracker)
+   - [Features](#features)
+   - [Quick start](#quick-start-ai-inventory-tracker)
+   - [Using the app](#using-the-app)
+   - [How quantities are updated](#how-quantities-are-updated)
+   - [Similar items and fuzzy matching](#similar-items-and-fuzzy-matching)
+   - [Settings](#settings)
+   - [Database schema](#database-schema-ai-inventory-tracker)
+3. [Pantry Tracker](#pantry-tracker)
+4. [Project structure](#project-structure)
+5. [Testing](#testing)
+6. [Troubleshooting](#troubleshooting)
+7. [Known limitations](#known-limitations)
+
+---
+
+## What's new
+
+Everything below is in the AI Inventory Tracker.
+
+### Fixes
+
+- **Quantities are now updated instead of duplicated.** *"I have removed 250 grams of active dry
+  yeast"* used to create a new row with quantity 250 and unit grams. It now finds the existing yeast
+  row and subtracts 250 g from it (converted to the row's own unit, so 2 kg becomes 1.75 kg).
+- **Add / remove / set is understood.** The parser returns an `action` for every item. The verbs in
+  your own sentence (*removed, used, sold, bought, received, "3 kg left"*) take priority over the
+  model's answer, because small models often get this wrong. Mixed sentences such as *"bought 3 kg
+  rice and used 1 kg salt"* are handled item by item.
+- **Units are converted.** Grams, kilograms, ounces, pounds, millilitres, litres, teaspoons,
+  tablespoons, cups and fluid ounces convert between each other. Units that cannot be related (grams
+  vs litres) change nothing and show a warning.
+- **Stock never goes negative.** Removing more than you have sets the quantity to 0 and tells you.
+  Removing an item that does not exist creates nothing.
+- **Manual *ADD ITEM* merges** into an existing item instead of creating a duplicate.
+- **More precise quantities.** The `quantity` column is widened to `NUMERIC(12, 3)` (migrated
+  automatically) so that, for example, 5 g = 0.005 kg is not rounded away.
+- **Change history is accurate.** Manual quantity edits are logged as the real change (new − old)
+  instead of the absolute value.
+- **The database connection times out after 5 seconds** instead of freezing the window.
+
+### Similar-item matching
+
+- **Fuzzy matching**: *instant dry yeast*, *active dry yeast* and *yeast* (or *basmati rice*,
+  *red rice* and *rice*) are recognised as variations of the same item. See
+  [Similar items and fuzzy matching](#similar-items-and-fuzzy-matching).
+- **Three behaviours** you can choose in Settings: keep everything separate (legacy), merge confident
+  matches and ask when unsure (default), or ask for every similar item.
+- **"Remember my choice"**: answers to the "is this the same item?" question are stored and not asked
+  again.
+- **⧉ Merge similar** tool for rows that already exist as separate items.
+
+### GUI
+
+- **Sortable columns**: click a table heading to sort, click again to reverse (▲ / ▼).
+- **☢ Erase all**: wipes the database, protected by a dialog and a press-and-hold confirmation.
+- **Scrollable *Manual Entry*** panel: the left panel scrolls with the mouse wheel or scrollbar.
+- **⚙ Settings** dialog: change the database host, port, name, username and password, the Ollama URL
+  and the matching options without editing code. Includes *Test connection*.
+
+### Project
+
+- `inventory_logic.py` (new): all matching, unit and action logic as plain, testable Python.
+- `test_inventory_logic.py` (new): 40 unit and database tests.
+- `config.py` now loads and saves `settings.json`; `settings.json` is in `.gitignore`.
+- This README and `docs/CODE_GUIDE.md`.
+
+---
+
+## AI Inventory Tracker
+
+### Features
+
+- Type in plain English: *"Bought 3 kg rice and 2 litres oil today"* → structured items with name,
+  action, quantity, unit, category and dates, parsed by a local Ollama model (streamed live).
+- Review the parsed result and **SAVE ALL** or **Discard**.
+- Manual entry form (add, update the selected row, delete).
+- Searchable, filterable, **sortable** inventory table with low-stock highlighting.
+- Statistic cards: total items, unique items, categories, items added today.
+- Update-instead-of-duplicate quantity logic with unit conversion.
+- Fuzzy matching of item variations with prompts, remembered answers and a merge tool.
+- Full change history in the `inventory_log` table.
+- Settings dialog and a protected "erase everything" button.
+
+### Quick start (AI Inventory Tracker)
+
+**1. Requirements**
+
+- Python 3.9 or newer with Tkinter (included with the python.org installers; on Debian/Ubuntu:
+  `sudo apt install python3-tk`)
+- PostgreSQL (local install or Docker)
+- [Ollama](https://ollama.com/download) with at least one model, for example `ollama pull tinyllama`
+  (the app lists whatever models you have installed and prefers `tinyllama`)
+
+**2. Install the Python packages**
 
 ```bash
-docker compose up -d          # or use an existing Postgres and edit config.py
+pip install -r requirements.txt        # psycopg2-binary, requests
 ```
 
-### 2 — Install Ollama & pull a model
+**3. Start PostgreSQL** – either your own server, or the included Docker file:
 
 ```bash
-# https://ollama.com/download
-ollama pull tinyllama         # default in the GUI; llama3.2 / mistral / qwen2.5 also work
-ollama serve                  # http://localhost:11434
+docker compose up -d
 ```
 
-### 3 — Install Python dependencies
+**4. Create the database** (creates `inventory_db`, the tables and four sample rows):
 
 ```bash
-pip install -r requirements.txt
-pip install matplotlib numpy sounddevice        # charts + microphone
+python setup_db.py
 ```
 
-Voice recognition needs **one** of the backends below (see [Voice input](#voice-input)).
+`setup_db.py` connects as the `postgres` user with password `postgres` on `localhost:5432`; edit
+`ADMIN_CONFIG` at the top of the file if yours differ.
 
-### 4 — Run
+**5. Run**
 
 ```bash
+ollama serve          # if Ollama is not already running
 python main.py
 ```
 
----
+The status text in the header tells you what is connected: `● Ready`, `● DB ok | Ollama offline`,
+and so on. If the database login is wrong, click **⚙ Settings** (top right) and fix it there.
 
-## Input box controls
+### Using the app
 
-The input box (and the Large input window) supports:
+**Natural-language input (left panel)**
 
-| Action | How |
-|---|---|
-| Clear everything | **✕ Clear** button above the box, or right-click → *Clear all* (Ctrl+Z brings it back) |
-| Clear part of the text | Select it with the mouse or Shift+arrows, then **Backspace** / **Delete** (or right-click → *Delete selection*) |
-| Select all | **Ctrl+A** |
-| Undo / redo | **Ctrl+Z** / **Ctrl+Y** (or Ctrl+Shift+Z) |
-| Delete a word | **Ctrl+Backspace** (before the cursor) / **Ctrl+Delete** (after it) |
-| Cut / copy / paste | **Ctrl+X** / **Ctrl+C** / **Ctrl+V** or the right-click menu |
-| New line | **Shift+Enter** |
-| Parse | **Enter** |
+1. Type something like `I have removed 250 grams of active dry yeast` and press **PARSE WITH AI**.
+2. The *AI RESPONSE* box shows what was understood, for example `－ remove 250 g Active Dry Yeast [Food]`
+   (`＋ add`, `－ remove` or `＝ set to`).
+3. Press **✓ SAVE ALL**. Each line of the result is reported: what changed and from which quantity
+   to which (`active dry yeast: removed (2 kg -> 1.75 kg)`). Problems are marked with ⚠.
 
-On macOS the Command key works in place of Ctrl. If the box is left empty it shows the example text again.
+**Manual entry (left panel, scrolls)**
 
----
+Fill in the fields and press **＋ ADD ITEM** (adds to an existing item of that name or creates it),
+or select a table row, edit the fields and press **✎ UPDATE** to overwrite its values.
 
-## Large inputs
+**Table (right panel)**
 
-A small local model cannot turn 100 items into 100 JSON objects in one prompt: the input overflows its
-context window and it stops after a few items. StockLlama therefore handles big inputs differently:
+| Control | What it does |
+|---------|--------------|
+| Search box | Filters by item name as you type |
+| Category drop-down | Filters by category |
+| **⟳ Refresh** | Reloads the table |
+| **⧉ Merge similar** | Finds items that look like variations of one another and lets you merge them |
+| **☢ Erase all** | Deletes everything (see below) |
+| **🗑 Delete** | Deletes the selected row after a confirmation |
+| Column headings | Click to sort by that column; click again for the opposite order |
 
-| Input | What happens |
-|---|---|
-| **JSON** (list, JSON lines, `{"Rice": "3 kg"}` mapping, or JSON pasted inside other text) | Imported **directly, with no AI**. Exact and instant. |
-| **CSV / TSV** with a header row | Imported directly, same as JSON. |
-| **Plain text** (many lines, bullets, long comma lists) | Split into batches of up to 8 lines, sent to the model one batch at a time, then merged. |
-| One short sentence | Sent to the model as before. |
+Rows at or below the low-stock threshold (5, set as `low_stock_threshold` in `config.py`) are shown in
+orange. The default order is *Last Updated*, newest first.
 
-Click **⤢ Large…** (next to *Parse with AI*) for a big editor window. You can paste, or **Open file…**
-(`.json`, `.csv`, `.tsv`, `.txt`), and it tells you before you parse what it detected, for example
-*"JSON detected: 100 item(s) will be imported directly"* or *"250 text lines -> 32 AI batches"*.
-Pasting into the normal input box works the same way.
+**Sorting.** The current column shows ▲ (ascending) or ▼ (descending). Numbers sort numerically
+(`ID`, `Qty`), dates chronologically, text case-insensitively. Empty values always go to the end.
+The chosen order is kept when the table refreshes.
 
-**While batches run** you see *Processing batch 3/12* and can press **■ Cancel** (it stops after the
-current batch and keeps what was parsed). If some batches fail or return nothing, the rest are kept
-and **↻ Retry** re-runs only the failed ones. If Ollama goes down mid-way, the unprocessed batches
-can be retried once it is back.
+**☢ Erase all.** Press the red button and a dialog states how many items would be deleted. To
+continue you must **press and hold the red bar for 3 seconds**; the bar fills as you hold. Letting go,
+moving the pointer off the bar or pressing Esc cancels. It deletes all items, the whole change
+history and the remembered matching choices, and restarts the id counters. This cannot be undone.
 
-**Review before saving.** The confirm area shows the first 8 items; **👁 Review** opens a table of all of
-them. Double-click a cell to fix it, select rows and press Delete to drop them, then save. Nothing is
-written to the database until you save.
+### How quantities are updated
 
-**Accepted field names** (case-insensitive) for JSON/CSV:
+For every parsed or manually added entry the app decides **which row** it refers to and **what to do**:
 
-| Field | Also accepted as |
-|---|---|
-| `item_name` | `name`, `item`, `product`, `ingredient`, `title`, `description` |
-| `quantity` | `qty`, `amount`, `count`, `number` (`"3 kg"` also sets the unit) |
-| `unit` | `uom`, `measure` |
-| `category` | `cat`, `group` |
-| `date_bought` | `bought`, `purchased`, `date_purchased`, `purchase_date` |
-| `date_used` | `used`, `used_on`, `date_consumed` |
-| `notes` | `note`, `remarks`, `comment` |
-| `date` + `action` | a generic `date` is a *use* if `action`/`type` says used/consumed/issued/sold/out, otherwise a purchase |
+| Action | Triggered by (examples) | Effect |
+|--------|------------------------|--------|
+| `add` | bought, purchased, received, added, restocked, got, delivered | Increases the matching row, or creates it |
+| `remove` | removed, used, consumed, took, sold, finished, ate, threw away, spent | Decreases the matching row (never below 0). Creates nothing if the item is unknown |
+| `set` | "I now have 3 kg", "2 kg left", "stocktake" | Overwrites the quantity |
 
-Dates may be `YYYY-MM-DD` or day-first (`16/10/2026`, `16-10-2026`, `16 Oct 2026`), or `today` / `yesterday`.
-Rows with no name are skipped; a missing quantity becomes 1; unreadable dates are left empty. Every such
-problem is listed in the Logs tab for that input.
+Rules, in order of priority for the action: explicit verbs in your sentence → the model's `action`
+field → a negative quantity means remove → default `add`.
 
-**Limits.** Batches are processed independently, so context from one line does not carry to the next
-(for example a trailing *"all bought yesterday"* applies only to its own batch). Put the date on each
-line or use JSON/CSV for big imports. Each batch still depends on the model's accuracy: use Review.
-
----
-
-## Voice input
-
-Click **🎙 RECORD**, speak, click **■ STOP**. The transcription is placed in the input box
-(appended if text is already there) so you can correct it before pressing **PARSE WITH AI**.
-The speech model loads in the background while you are still talking.
-
-### Models
-
-| Group | Models | Backend | Install |
-|---|---|---|---|
-| **FUTO ACFT** (Whisper fine-tuned by FUTO) | tiny / base / small, English-only (`.en`) and multilingual | `transformers` | `pip install transformers torch` |
-| **Stock Whisper** | tiny.en, base.en, small.en, medium.en, small, medium, large-v3 | `faster-whisper` | `pip install faster-whisper` |
-| **Local files** | any whisper.cpp `.bin` (e.g. FUTO's GGML downloads) | `pywhispercpp` | `pip install pywhispercpp` |
-| **Local folders** | Hugging Face Whisper folder, or CTranslate2 folder | auto-detected | — |
-
-FUTO's models come from <https://github.com/futo-org/whisper-acft>; the Hub checkpoints are
-named `futo-org/acft-whisper-{tiny,base,small}[.en]` and download automatically on first use
-(~75 MB tiny, ~142 MB base, ~465 MB small). **base.en** is the default: a good speed/accuracy balance.
-
-**Adding your own model:** click **…** next to the model list, or drop a `.bin` file / model folder
-into `models/stt/` and restart. Any Hugging Face repo id can also be loaded from code:
-`SpeechRecognizer().load("owner/repo")`.
-
-**Language:** `auto` by default; pick `en`, `hi`, `kn`, `ta`, … for multilingual models.
-English-only (`.en`) models ignore this setting. Accuracy on non-English speech with tiny/base is limited.
-
-> **Note on FUTO's speed advantage.** FUTO's ACFT models are designed to run with whisper.cpp's
-> *dynamic audio context*, which is what makes short dictations fast on phones. The `.bin`
-> (whisper.cpp) route uses it automatically for files with `acft` in the name. Through the
-> `transformers` route the models run the normal 30 s window: they work fine, just without that speed-up.
-
----
-
-## Predictions
-
-The **🔮 Predictions** tab learns each ingredient's usage pattern from your history and answers:
-
-- **Which ingredient will be used next, and when?** (*Next use* column, plus a *Chance* that it is used within the window you pick: 3 / 7 / 14 / 30 days)
-- **When will the stock run out?** (*Runs out* date and a *Days left* range)
-- **Should I reorder?** (*Advice*: Reorder now / Reorder soon / OK / Out of stock / Possibly inactive)
-
-Sort by *Next use*, *Runs out first* or *Most likely*. Set the **reorder lead time** (days your supplier needs)
-and the advice adapts. Select a row for a plain-language explanation and a chart of past stock with the
-projected stock, the likely range, the next expected use and the "reorder by" date.
-
-**How it works** (simple and explainable, no training step):
-
-| Quantity | Method |
-|---|---|
-| Typical gap | median days between usage days (last 10 usage days only, so it follows changing habits) |
-| Consumption per day | quantity used ÷ days elapsed over that window |
-| Next use | last use + typical gap (shown as "today" if overdue) |
-| Chance in N days | of the past gaps still "open", the share that ended within N days (smoothed, never 0% or 100%) |
-| Run-out range | current stock ÷ fast (75th percentile) and slow (25th percentile) consumption rates |
-| Confidence | few records = low, 6+ = medium, 10+ = high; one level lower if the gaps are very irregular |
-
-**Self-check.** The tab back-tests itself on your own history: it predicts each past usage date from the
-ones before it and reports the average error in days. Ingredients need 4+ usage days for this.
-
-**Limits to know about**
-
-- An ingredient needs at least **3 usage days** before it is predicted; otherwise it shows *Not enough data*.
-- Only *current stock* is projected; future purchases are not assumed.
-- Forecasts are only as good as the data: a usage must be recorded as **used** (a `date_used`), see below.
-- It is a statistical heuristic, not a trained machine-learning model.
-
-### Recording usage so predictions work
-
-An entry counts as usage only if it has a `date_used` and no `date_bought`. If the LLM leaves both dates empty
-(e.g. *"used 2 kg rice"* with no date), it is treated as a purchase. Add these rules to `SYSTEM_PROMPT`
-in `ollama_parser.py` so dates are always filled:
+The quantity is converted into the **unit of the stored row**:
 
 ```
-- If the text says an item was used, consumed, finished or cooked, put the date in date_used and leave date_bought null. If no date is given, use today's date: {today}
-- If the text says an item was bought, purchased, received or restocked, put the date in date_bought. If no date is given, use today's date: {today}
-- Never fill both date_used and date_bought for the same item
+stock:  Active Dry Yeast  2 kg
+input:  "I have removed 250 grams of active dry yeast"
+result: Active Dry Yeast  1.75 kg        (250 g = 0.25 kg)
 ```
 
-Small models such as tinyllama sometimes ignore rules like these, so check the parsed items before pressing SAVE ALL.
+| Situation | Outcome |
+|-----------|---------|
+| Remove more than is in stock | Set to 0, warning shown (`clamped`) |
+| Remove an item that is not in the inventory | Nothing changes (`not_found`) |
+| Units cannot be converted (g vs l, boxes vs kg) | Nothing changes for removals (`unit_mismatch`); an addition becomes a separate row |
+| Add with no matching item | New row is created |
 
----
+Each change is written to `inventory_log` (`added`, `removed`, `set`, `updated`, `merged`).
 
-## Activity log
+### Similar items and fuzzy matching
 
-Every input produces an entry containing:
+Real inventories contain variations of the same thing: *yeast*, *active dry yeast*, *instant dry
+yeast*; *rice*, *basmati rice*, *red rice*. The app scores how similar two names are (0–100 %) and
+acts on the score.
 
-- **date** and time,
-- the **input prompt** (typed, spoken or a manual add/update/delete),
-- the **events** that followed: speech transcription, Ollama model used, raw LLM response,
-  parsed items, saved / discarded / updated / deleted, errors.
+**How the score works**
 
-Files are written to `./logs/` (override with the `STOCKLLAMA_LOG_DIR` environment variable):
+- Names are lower-cased, punctuation and plurals are ignored (`Tomatoes` = `tomato`), and small
+  typos count as the same word (`yest` ≈ `yeast`).
+- The **last word is the head noun** (yeast, rice, oil) and counts three times as much as the
+  modifiers in front of it.
+- A name whose words all appear in a longer name with the same head noun scores about **90 %**
+  (`rice` in `basmati rice`).
+- Same head noun but different modifiers scores about **60 %** (`basmati rice` / `red rice`).
+- A **different head noun** is capped at 40 % (`rice flour` is not `rice`; `tomato paste` is not `tomato`).
+- If both items have a category, the same category adds a little and different categories subtract
+  (so `olive oil` and an `engine oil` in *Automotive* do not look alike).
+- Only items whose unit can be converted are considered.
 
-| File | Purpose |
-|---|---|
-| `activity.jsonl` | Machine-readable, append-only; what the Logs tab reads |
-| `activity.log` | Human-readable, rotating (1 MB × 3) |
+| New entry | Existing item | Score | Default behaviour |
+|-----------|---------------|-------|-------------------|
+| instant dry yeast | yeast | 88 % | Merged silently |
+| basmati rice | rice | 90 % | Merged silently |
+| yest | yeast | 100 % | Merged silently (typo) |
+| red rice | basmati rice | 60 % | **Asks you** |
+| instant dry yeast | active dry yeast | 67 % | **Asks you** |
+| rice flour | rice | 40 % | Separate item |
 
-Example (`activity.log`):
+**The three behaviours** (⚙ Settings → *Item matching* → *When a similar item is found*)
 
-```
-2026-10-17 06:14:25 | [3f9a1c2e] INPUT (voice): bought 2 kg flour
-2026-10-17 06:14:25 | [3f9a1c2e]   speech: Transcribed with FUTO ACFT base.en (3.2s audio, 1.1s, language=auto)
-2026-10-17 06:14:25 | [3f9a1c2e]   model: Ollama model: tinyllama
-2026-10-17 06:14:25 | [3f9a1c2e]   parsed: 1 item(s) detected: ✓ 2.0 kg Flour [Food]
-2026-10-17 06:14:25 | [3f9a1c2e]   saved: Saved 1 item(s) to the database (ids: 5)
-```
+| Mode | Behaviour |
+|------|-----------|
+| **Legacy: keep every variation separate** | Only identical names merge (ignoring case and plurals). Everything else is its own item, as in the original app |
+| **Merge confident matches, ask when unsure** *(default)* | Scores at or above the *confident* threshold (85 %) merge without asking. Scores between the *similar* threshold (55 %) and 85 % open a prompt. Below 55 % the entry is a new item |
+| **Ask for every similar item** | The prompt appears for every similar item, even confident ones |
 
-### Logs tab
+Names that are exactly the same, or that you told the app to remember, never trigger a prompt in any mode.
+If two existing items are equally good matches (for example both `active dry yeast` and `dry yeast`
+exist) the app asks even in the default mode.
 
-Entries are listed newest first with a colour-coded result (`saved`, `awaiting save`, `discarded`,
-`no items`, `error`, …). Select one to see its full prompt and event timeline. You can search across
-prompts and events, filter by source (`typed` / `voice` / `file` / `manual`), and **Export CSV**.
-The tab updates live as new inputs arrive.
+**The prompt.** It lists the candidate items with their stock and score, plus *keep it as a separate
+item* (or *none of these* when removing). Tick **Remember my choice** to store the answer:
 
----
+- choosing an existing item + remember → the new name becomes an *alias* of that item and is
+  merged automatically from then on;
+- choosing *separate* + remember → that name is never offered those items again.
 
-## Charts
+Choosing *Skip this item* (or closing the window) leaves that entry unapplied. When several items
+are saved at once, the prompt says which one it is (`item 2 of 3`).
 
-Open the **📊 Charts** tab, then:
+**⧉ Merge similar (existing rows).** If similar items already exist as separate rows, press
+**⧉ Merge similar**. Groups are shown with their similarity; tick the groups to merge and pick the
+item to keep. The quantities of the others are converted into the kept item's unit and added, the
+change history is moved to the kept item, the most recent dates win, and the merged names are stored as
+aliases. Items with a unit that cannot be converted are left as they are and marked in the list.
 
-1. **Select ingredients** in the list (multi-select; *Select all* / *Clear*).
-2. **Choose a chart type**: Line, Area, Bar or Pie.
-3. Toggle **All ingredients in one chart**: on = a single chart, off = one chart per ingredient.
+### Settings
 
-Charts are drawn inside the window and redraw when you change anything. **Export PNG** saves them
-(a single file, or one file per ingredient into a folder).
+Open **⚙ Settings** (top right). Values are saved in `settings.json` next to the app and used from
+then on; the app reconnects as soon as you press **Save & reconnect**.
 
-| Type | Combined chart | Separate charts |
-|---|---|---|
-| Line / Area | Stock level over time, one line per ingredient | Stock level over time |
-| Bar | Current stock per ingredient | Daily change (green = bought, red = used) |
-| Pie | Share of current stock | Bought vs used |
+| Setting | Meaning |
+|---------|---------|
+| Host, Port, Database name, Username, Password | PostgreSQL connection (*Show password* reveals it) |
+| Ollama Server URL | Where Ollama is running (default `http://localhost:11434`) |
+| When a similar item is found | Matching mode (see above) |
+| Confident match from (%) | Similarity at which a match is merged without asking (default 85) |
+| Similar from (%) | Similarity at which items are considered similar at all (default 55) |
+| Forget remembered choices | Deletes all stored aliases and "keep separate" answers |
+| Test connection | Tries PostgreSQL and Ollama with the values entered, without saving |
 
-**How the numbers are derived.** Each row in the `inventory` table is one movement. A row with
-only `date_used` is consumption (−); anything else is a purchase / stock-in (+). The movement date
-is `date_bought`, else `date_used`, else the day the row was created. Ingredient names are grouped
-case-insensitively. Quantities in a combined chart can have different units (kg, liters, pieces);
-the axis then says *mixed units*.
+`settings.json` contains the database password in plain text. It is excluded by `.gitignore`; on
+Linux and macOS it is created readable only by you. To go back to the defaults, delete the file.
 
-Separate mode shows at most 12 charts at once; narrow the selection to see others.
+The model can be changed any time with the *Model* drop-down in the header.
 
----
+### Database schema (AI Inventory Tracker)
 
-## Configuration
-
-| Variable / file | Description |
-|---|---|
-| `config.py` | Database, Ollama and window settings |
-| `STOCKLLAMA_LOG_DIR` | Where log files are written (default `./logs`) |
-| `models/stt/` | Drop local speech models here |
-
----
-
-## Project layout
-
-```
-main.py            entry point
-app.py             main window: Inventory / Charts / Predictions / Logs tabs
-gui_tabs.py        ChartsTab, LogsTab, SpeechControls widgets
-predict_tab.py     PredictionsTab widget
-predictions.py     forecasting logic, back-test, forecast chart (no Tk)
-charts.py          chart data + matplotlib figure builders (no Tk)
-activity_log.py    activity logging (JSONL + readable log)
-stt_engine.py      speech models (FUTO / Whisper / whisper.cpp) + microphone capture
-database.py        PostgreSQL access (inventory, inventory_log)
-ollama_parser.py   LLM prompt + JSON parsing
-bulk_parse.py      JSON/CSV direct import, text batching, batched parsing (no Tk)
-config.py          settings
-requirements-extra.txt   optional packages for charts and voice
-```
-
-### Database schema
+`setup_db.py` creates the first two tables; the app itself creates/updates all four on start-up.
 
 ```sql
 CREATE TABLE inventory (
-    id SERIAL PRIMARY KEY, item_name VARCHAR(255) NOT NULL,
-    quantity NUMERIC(10,2) NOT NULL, unit VARCHAR(50), category VARCHAR(100),
-    date_used DATE, date_bought DATE, notes TEXT, raw_input TEXT,
-    created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW()
+    id           SERIAL PRIMARY KEY,
+    item_name    VARCHAR(255) NOT NULL,
+    quantity     NUMERIC(12, 3) NOT NULL,        -- widened from (10, 2) automatically
+    unit         VARCHAR(50),
+    category     VARCHAR(100),
+    date_used    DATE,
+    date_bought  DATE,
+    notes        TEXT,
+    raw_input    TEXT,                           -- the sentence that created/changed the row
+    created_at   TIMESTAMP DEFAULT NOW(),
+    updated_at   TIMESTAMP DEFAULT NOW()
 );
-CREATE TABLE inventory_log (
-    id SERIAL PRIMARY KEY, inventory_id INTEGER REFERENCES inventory(id) ON DELETE CASCADE,
-    action VARCHAR(50), quantity_change NUMERIC(10,2), notes TEXT,
-    logged_at TIMESTAMP DEFAULT NOW()
+
+CREATE TABLE inventory_log (                     -- history of every change
+    id              SERIAL PRIMARY KEY,
+    inventory_id    INTEGER REFERENCES inventory(id) ON DELETE CASCADE,
+    action          VARCHAR(50),                 -- added / removed / set / updated / merged
+    quantity_change NUMERIC(12, 3),
+    notes           TEXT,
+    logged_at       TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE item_aliases (                      -- "this name means that item"
+    alias_key    TEXT PRIMARY KEY,               -- normalised name, e.g. 'red rice'
+    alias_name   TEXT NOT NULL,
+    inventory_id INTEGER NOT NULL REFERENCES inventory(id) ON DELETE CASCADE,
+    created_at   TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE item_distinct (                     -- "this name is NOT that item"
+    inventory_id INTEGER NOT NULL REFERENCES inventory(id) ON DELETE CASCADE,
+    name_key     TEXT NOT NULL,
+    PRIMARY KEY (inventory_id, name_key)
 );
 ```
 
-The activity log described above is separate from `inventory_log`: it lives in files and records
-*what the user typed or said and what happened next*, not just row changes.
+---
+
+## Pantry Tracker
+
+A smaller, separate tool: natural-language pantry management in **kilograms**, as a command-line
+program (`run.py`) and a Tkinter window (`pantry_gui.py`). It uses its own database (`pantry`) and
+table (`pantry_items`) and does not use the fuzzy matching described above.
+
+### Features
+
+- Parse free-form sentences like *"I bought 12 kg onions and used 5 kg garlic"*
+- Positive actions (bought / received / added) **increase** quantity
+- Negative actions (used / consumed / finished) **decrease** quantity
+- Quantities floored at **0 kg**: no negative stock ever
+- New items are **auto-created**; existing items are **upserted**
+- Optional purchase date extraction from natural language
+- Weight normalisation: grams → kg, pounds → kg
+
+### Quick start
+
+**1 – Start PostgreSQL**
+
+```bash
+docker compose up -d            # creates a database called "pantry"
+```
+
+(or create it yourself: `CREATE DATABASE pantry;`)
+
+**2 – Install Ollama and pull a model**
+
+```bash
+ollama pull llama3.2            # ~2 GB, fast and accurate enough
+# or: ollama pull mistral   /   ollama pull qwen2.5
+ollama serve                    # http://localhost:11434
+```
+
+**3 – Install Python dependencies**
+
+```bash
+pip install -r requirements.txt
+```
+
+**4 – Run**
+
+```bash
+python run.py                   # command line
+python pantry_gui.py            # graphical version
+```
+
+### Configuration (environment variables)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DB_HOST` | `localhost` | Postgres host |
+| `DB_PORT` | `5432` | Postgres port |
+| `DB_NAME` | `pantry` | Database name |
+| `DB_USER` | `postgres` | Postgres user |
+| `DB_PASSWORD` | `postgres` | Postgres password |
+| `OLLAMA_HOST` | `http://localhost:11434` | Ollama base URL |
+| `OLLAMA_MODEL` | `llama3.2` | Model name to use |
+
+```bash
+OLLAMA_MODEL=mistral DB_PASSWORD=secret python run.py
+```
+
+The GUI also has a **⚙ Settings** window for the same values (applied for the current session).
+
+### CLI flags
+
+```bash
+python run.py --setup    # create table, then exit
+python run.py --list     # print current inventory, then exit
+python run.py --reset    # drop + recreate table, then exit (deletes all data)
+```
+
+### Example session
+
+```
+You: I bought 12kg onions and 1kg tomatoes, used 5kg garlic
+
+🤖  Asking LLM… done.
+
+📝  Detected 3 operation(s):
+     • onion: +12.000 kg
+     • tomato: +1.000 kg
+     • garlic: -5.000 kg
+
+✅  Database updated:
+  🆕  onion: added 12.000 kg (new item)
+  🆕  tomato: added 1.000 kg (new item)
+  ⚠️   garlic: cannot reduce — item not found in inventory
+
+You: received 3kg garlic, used 500g tomato
+
+✅  Database updated:
+  🆕  garlic: added 3.000 kg (new item)
+  ➖  tomato: 1.000 kg → 0.500 kg
+
+You: list
+```
+
+### How it works
+
+```
+User input → Ollama (local LLM) → JSON operations → PostgreSQL
+                                                     ├─ item exists?  → UPDATE quantity_kg, last_updated
+                                                     └─ new item?     → INSERT row
+```
+
+The model returns a strict JSON schema; the app never lets a quantity go below 0:
+
+```json
+{ "operations": [
+    { "name": "onion",  "delta_kg":  12.0, "purchased_at": null },
+    { "name": "garlic", "delta_kg":  -5.0, "purchased_at": null } ] }
+```
+
+### Database schema (Pantry Tracker)
+
+```sql
+CREATE TABLE pantry_items (
+    id            SERIAL PRIMARY KEY,
+    name          TEXT    NOT NULL UNIQUE,
+    quantity_kg   NUMERIC(12, 3) NOT NULL DEFAULT 0,
+    last_updated  TIMESTAMPTZ    NOT NULL DEFAULT NOW()
+);
+```
+
+---
+
+## Project structure
+
+Only the project's own files are listed. (A committed virtual environment — `bin/`, `lib/`,
+`lib64/`, `share/`, `pyvenv.cfg` — and `__pycache__/` folders are installed/generated content and
+are not part of the source.)
+
+```
+.
+├── main.py                  Starts the AI Inventory Tracker GUI
+├── app.py                   The GUI: window, dialogs, table, all user actions
+├── database.py              PostgreSQL access for the Inventory Tracker (DatabaseManager)
+├── inventory_logic.py       Pure logic: units, names, similarity, matching, action detection
+├── ollama_parser.py         Talks to Ollama and turns sentences into structured items
+├── config.py                Default settings + loading/saving of settings.json
+├── setup_db.py              One-time creation of inventory_db, tables and sample data
+├── test_inventory_logic.py  Unit and database tests
+├── settings.json            (created by the Settings dialog; git-ignored)
+│
+├── run.py                   Starts the Pantry Tracker command line
+├── pantry_tracker.py        Pantry Tracker core + CLI (kg-based, table pantry_items)
+├── pantry_gui.py            Pantry Tracker Tkinter window
+│
+├── docker-compose.yml       PostgreSQL 16 container (database "pantry")
+├── requirements.txt         psycopg2-binary, requests
+├── docs/CODE_GUIDE.md       File-by-file guide to the code
+│
+├── ollama_funcs/            Experimental Ollama snippet (not used by the apps)
+├── mongodb_funcs/           Empty placeholder files (not used)
+└── sorting/                 Unrelated file-sorting helper scripts (not used)
+```
+
+---
+
+## Testing
+
+```bash
+python -m unittest test_inventory_logic -v
+```
+
+- The **logic tests** (units, action detection, similarity, matching decisions, grouping) need
+  nothing but Python.
+- The **database tests** (quantity updates, merging, remembered choices, the "250 grams of yeast"
+  scenario, the matching modes, merge tool) use the PostgreSQL configured in `config.py` /
+  `settings.json`. They only create and delete rows whose names start with `ZZ test ` or `ZZ fz `,
+  and are skipped automatically when PostgreSQL cannot be reached.
 
 ---
 
 ## Troubleshooting
 
-- **"needs an extra package"** – install the pip package named in the message for that model.
-- **No microphone / `sounddevice` error** – `pip install sounddevice`; on Linux also `sudo apt install libportaudio2`.
-- **First voice use is slow** – the model is downloading; later runs use the cached copy.
-- **Charts tab says "No inventory data yet"** – add items first (or check the database connection).
-- **Ollama offline** – run `ollama serve` and `ollama pull <model>`.
+| Problem | What to do |
+|---------|------------|
+| *"Could not connect to PostgreSQL"* at start-up | Press **⚙ Settings** → correct host/port/database/user/password → **Test connection** → **Save & reconnect**. Run `python setup_db.py` if `inventory_db` does not exist yet |
+| Header shows *Ollama offline* | Start it with `ollama serve`, or fix the URL in Settings |
+| Parsing returns wrong or no items | Try a larger model in the *Model* drop-down; small models are less reliable. Verbs like *removed* or *bought* in the sentence help |
+| An item was merged into the wrong one | Use **⚙ Settings → Forget remembered choices**, or switch the mode to *Ask for every similar item* / raise *Confident match from (%)* |
+| A removal did nothing | Read the ⚠ message: the item is not in the inventory, the units cannot be converted, or the name matched several items equally and you skipped it |
+| Items from older versions are duplicated (e.g. *yeast* and *yeast – 250 g*) | Press **⧉ Merge similar** to combine them |
+| `ModuleNotFoundError: tkinter` | Install Tkinter (`sudo apt install python3-tk` on Debian/Ubuntu) |
+
+---
+
+## Known limitations
+
+- Fuzzy matching is name-based: a bare name contained in a longer one with the same last word scores as
+  a confident match, so *coconut milk* can be merged into *milk* in the default mode. Raise the
+  confident threshold or use *Ask for every similar item* if that is too eager.
+- Low-stock highlighting compares the raw number with one threshold regardless of unit.
+- The parsed *category* comes from the language model and may vary.
+- Only English sentences are tuned for.
+- `settings.json` stores the database password unencrypted.
