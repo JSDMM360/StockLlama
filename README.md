@@ -62,13 +62,20 @@ Everything below is in the AI Inventory Tracker.
 ### Similar-item matching
 
 - **Fuzzy matching**: *instant dry yeast*, *active dry yeast* and *yeast* (or *basmati rice*,
-  *red rice* and *rice*) are recognised as variations of the same item. See
-  [Similar items and fuzzy matching](#similar-items-and-fuzzy-matching).
+  *red rice* and *rice*) are recognised as related names. **Stricter rule:** only the *same* name
+  (spelling variant, plural, or a name from your dictionary) is merged silently; a name that merely
+  contains another (*kidney beans* / *beans*) is always asked about, because it may be a different
+  item. See [Similar items and fuzzy matching](#similar-items-and-fuzzy-matching).
+- **📖 Names dictionary**: an item can have several names, including everyday local ones (*mint* =
+  *pudina*, *curd* = *yogurt*, *turmeric* = *haldi*). Names of one group are treated as one item in
+  both directions. See [Names dictionary](#names-dictionary-several-names-for-one-item).
 - **Three behaviours** you can choose in Settings: keep everything separate (legacy), merge confident
   matches and ask when unsure (default), or ask for every similar item.
 - **"Remember my choice"**: answers to the "is this the same item?" question are stored and not asked
   again.
-- **⧉ Merge similar** tool for rows that already exist as separate items.
+- **⧉ Merge similar** tool for rows that already exist as separate items. Every item in a group gets
+  its own decision (keep separate, or merge into another item), so *soya sauce* and *hot sauce*, or
+  *kidney beans*, *mung beans* and *red beans*, can be kept as separate items.
 
 ### GUI
 
@@ -81,7 +88,8 @@ Everything below is in the AI Inventory Tracker.
 ### Project
 
 - `inventory_logic.py` (new): all matching, unit and action logic as plain, testable Python.
-- `test_inventory_logic.py` (new): 40 unit and database tests.
+- `default_names.py` (new): optional starter list of common local names for the dictionary.
+- `test_inventory_logic.py` (new): 62 unit and database tests.
 - `config.py` now loads and saves `settings.json`; `settings.json` is in `.gitignore`.
 - This README and `docs/CODE_GUIDE.md`.
 
@@ -165,7 +173,8 @@ or select a table row, edit the fields and press **✎ UPDATE** to overwrite its
 | Search box | Filters by item name as you type |
 | Category drop-down | Filters by category |
 | **⟳ Refresh** | Reloads the table |
-| **⧉ Merge similar** | Finds items that look like variations of one another and lets you merge them |
+| **⧉ Merge similar** | Finds items with similar names and lets you decide, item by item, what to keep separate and what to merge |
+| **📖 Names** | Opens the names dictionary (several names for one item); starts at the selected item |
 | **☢ Erase all** | Deletes everything (see below) |
 | **🗑 Delete** | Deletes the selected row after a confirmation |
 | Column headings | Click to sort by that column; click again for the opposite order |
@@ -224,8 +233,11 @@ acts on the score.
   typos count as the same word (`yest` ≈ `yeast`).
 - The **last word is the head noun** (yeast, rice, oil) and counts three times as much as the
   modifiers in front of it.
-- A name whose words all appear in a longer name with the same head noun scores about **90 %**
-  (`rice` in `basmati rice`).
+- Names made of the same words (allowing spelling variants and plurals), or names your
+  [dictionary](#names-dictionary-several-names-for-one-item) lists as one item, score **100 %**.
+  This is the only case that is ever *confident*.
+- A name whose words all appear in a longer name with the same head noun scores **at most 80 %**
+  (`rice` in `basmati rice`, `beans` in `kidney beans`): related, but possibly a different item.
 - Same head noun but different modifiers scores about **60 %** (`basmati rice` / `red rice`).
 - A **different head noun** is capped at 40 % (`rice flour` is not `rice`; `tomato paste` is not `tomato`).
 - If both items have a category, the same category adds a little and different categories subtract
@@ -234,9 +246,12 @@ acts on the score.
 
 | New entry | Existing item | Score | Default behaviour |
 |-----------|---------------|-------|-------------------|
-| instant dry yeast | yeast | 88 % | Merged silently |
-| basmati rice | rice | 90 % | Merged silently |
-| yest | yeast | 100 % | Merged silently (typo) |
+| yest | yeast | 100 % | Merged silently (spelling) |
+| Tomatoes | tomato | 100 % | Merged silently (plural) |
+| pudina | mint | 100 % | Merged silently *if the dictionary says so* |
+| instant dry yeast | yeast | 78 % | **Asks you** (related name) |
+| basmati rice | rice | 80 % | **Asks you** |
+| kidney beans | beans | 80 % | **Asks you** |
 | red rice | basmati rice | 60 % | **Asks you** |
 | instant dry yeast | active dry yeast | 67 % | **Asks you** |
 | rice flour | rice | 40 % | Separate item |
@@ -246,10 +261,11 @@ acts on the score.
 | Mode | Behaviour |
 |------|-----------|
 | **Legacy: keep every variation separate** | Only identical names merge (ignoring case and plurals). Everything else is its own item, as in the original app |
-| **Merge confident matches, ask when unsure** *(default)* | Scores at or above the *confident* threshold (85 %) merge without asking. Scores between the *similar* threshold (55 %) and 85 % open a prompt. Below 55 % the entry is a new item |
+| **Merge confident matches, ask when unsure** *(default)* | Scores at or above the *confident* threshold (85 %: same name, spelling variant, dictionary name) merge without asking. Scores between the *similar* threshold (55 %) and 85 % open a prompt. Below 55 % the entry is a new item. (To get the old, looser behaviour back, lower *Confident match from* to 80 %) |
 | **Ask for every similar item** | The prompt appears for every similar item, even confident ones |
 
-Names that are exactly the same, or that you told the app to remember, never trigger a prompt in any mode.
+Names that are exactly the same, names the dictionary lists as one item, and names you told the app to
+remember never trigger a prompt in any mode.
 If two existing items are equally good matches (for example both `active dry yeast` and `dry yeast`
 exist) the app asks even in the default mode.
 
@@ -264,10 +280,59 @@ Choosing *Skip this item* (or closing the window) leaves that entry unapplied. W
 are saved at once, the prompt says which one it is (`item 2 of 3`).
 
 **⧉ Merge similar (existing rows).** If similar items already exist as separate rows, press
-**⧉ Merge similar**. Groups are shown with their similarity; tick the groups to merge and pick the
-item to keep. The quantities of the others are converted into the kept item's unit and added, the
-change history is moved to the kept item, the most recent dates win, and the merged names are stored as
-aliases. Items with a unit that cannot be converted are left as they are and marked in the list.
+**⧉ Merge similar**. Items are grouped by similar *names* (all the sauces, all the beans), but a group
+is only a suggestion: *soya sauce* and *hot sauce* share a word and are still different items.
+So the dialog does not force "one item per group":
+
+- **Every item has its own drop-down**: *Keep as a separate item*, or *Merge into "…"* any other item
+  of the group that is being kept. Keep as many items as you like and merge only the ones that really
+  are the same. A group can even contain several separate merges (for example *Dried Kidney Beans*
+  into *Kidney Beans* while *Mung Beans* stays on its own).
+- **Safe by default**: only confident matches (at or above the *Confident match from* setting, which in
+  practice means the same name or two names from your [dictionary](#names-dictionary-several-names-for-one-item),
+  such as *Mint* and *Pudina*) are suggested for merging. Items that merely share or contain a word
+  (*kidney beans*, *mung beans*, *beans*; *soya sauce*, *hot sauce*; *rice*, *basmati rice*) are preselected
+  as *Keep as a separate item*; you merge them by choosing so.
+- **Rules that keep the result valid**: an item that others are merged into cannot itself be merged
+  away, and an item can only be merged into an item that is being kept and whose unit it can be
+  converted to.
+- **Live preview** under each group lists what you will end up with, for example
+  `Beans: 1.5 kg  absorbs: Red Beans`, `Kidney Beans: 1 kg`, `Mung Beans: 2 kg`. Buttons:
+  *Suggestion* (restore the default choices) and *Keep all separate*.
+- **Apply this group** must be ticked for a group to be applied (groups with suggested merges are
+  pre-ticked). When applied, merged quantities are converted into the kept item's unit and added, the
+  change history is moved to the kept item, the most recent dates win, and the merged names become
+  aliases. Items you kept separate are **remembered as different**: they are not suggested together
+  again and a new entry for one is never matched to the other (undo with *Settings → Forget remembered
+  choices*). Nothing is deleted unless you choose to merge it.
+
+### Names dictionary (several names for one item)
+
+An item can be known by more than one name, and a local name such as *pudina* shares no letters with
+its English name *mint*, so no similarity score can find the connection. The **names dictionary** lets
+you state it once:
+
+- **📖 Names** (table toolbar) opens the dictionary. Type the names separated by commas
+  (`mint, pudina`) and press **Create group**, or select an item first so the dialog opens at its
+  group, then **Add name** to add one more name to a group (`mint, pudina, pudhina`).
+- From then on the names are **one item in both directions**: an entry for *pudina* updates the row
+  stored as *Mint* (`Mint: added (3 kg -> 3.5 kg)  [counted 'pudina' as 'Mint']`), and an entry for
+  *mint* updates a row stored as *Pudina*. No question is asked, in any matching mode.
+- It also works **inside longer names** (`fresh pudina` ≈ `fresh mint`, `pudina leaves` ≈
+  `mint leaves`) and with **phrases** (`curry leaf` = `kadi patta`).
+- It does not depend on rows: define the names **before or after** the items exist. If items already
+  exist under different names, closing the dialog offers to **review and merge** them (they appear in
+  *Merge similar* with a 100 % score).
+- **Load starter names** adds about 40 common groups (mint = pudina, coriander = cilantro = dhania,
+  turmeric = haldi, yogurt = curd = dahi, …) from `default_names.py`. Nothing is loaded automatically
+  and every group can be edited or deleted.
+- Groups merge when they overlap (adding `pudina, spearmint` to a group that has *pudina* gives one
+  group). A name can belong to only one group. Removing a group's second-to-last name deletes the group.
+- The dictionary is stored in PostgreSQL (`name_groups`, `name_group_names`). It is knowledge, not
+  stock, so **Erase all** and *Forget remembered choices* do not delete it.
+
+> The dictionary is what makes *Merge similar* confident about items with different names. It is
+> deliberately explicit: the app never guesses that two unrelated words mean the same thing.
 
 ### Settings
 
@@ -291,7 +356,7 @@ The model can be changed any time with the *Model* drop-down in the header.
 
 ### Database schema (AI Inventory Tracker)
 
-`setup_db.py` creates the first two tables; the app itself creates/updates all four on start-up.
+`setup_db.py` creates the first two tables; the app itself creates/updates all six on start-up.
 
 ```sql
 CREATE TABLE inventory (
@@ -328,6 +393,17 @@ CREATE TABLE item_distinct (                     -- "this name is NOT that item"
     inventory_id INTEGER NOT NULL REFERENCES inventory(id) ON DELETE CASCADE,
     name_key     TEXT NOT NULL,
     PRIMARY KEY (inventory_id, name_key)
+);
+
+CREATE TABLE name_groups (                       -- names dictionary: one row per item
+    id    SERIAL PRIMARY KEY,
+    label TEXT NOT NULL
+);
+
+CREATE TABLE name_group_names (                  -- every name of that item
+    name_key     TEXT PRIMARY KEY,               -- normalised name, e.g. 'pudina'
+    display_name TEXT NOT NULL,
+    group_id     INTEGER NOT NULL REFERENCES name_groups(id) ON DELETE CASCADE
 );
 ```
 
@@ -472,10 +548,11 @@ are not part of the source.)
 ├── main.py                  Starts the AI Inventory Tracker GUI
 ├── app.py                   The GUI: window, dialogs, table, all user actions
 ├── database.py              PostgreSQL access for the Inventory Tracker (DatabaseManager)
-├── inventory_logic.py       Pure logic: units, names, similarity, matching, action detection
+├── inventory_logic.py       Pure logic: units, names, similarity, dictionary, matching, action detection
 ├── ollama_parser.py         Talks to Ollama and turns sentences into structured items
 ├── config.py                Default settings + loading/saving of settings.json
 ├── setup_db.py              One-time creation of inventory_db, tables and sample data
+├── default_names.py         Optional starter list of common local names (names dictionary)
 ├── test_inventory_logic.py  Unit and database tests
 ├── settings.json            (created by the Settings dialog; git-ignored)
 │
@@ -500,7 +577,7 @@ are not part of the source.)
 python -m unittest test_inventory_logic -v
 ```
 
-- The **logic tests** (units, action detection, similarity, matching decisions, grouping) need
+- The **logic tests** (units, action detection, similarity, matching decisions, grouping, "keep separate" pairs) need
   nothing but Python.
 - The **database tests** (quantity updates, merging, remembered choices, the "250 grams of yeast"
   scenario, the matching modes, merge tool) use the PostgreSQL configured in `config.py` /
@@ -516,7 +593,7 @@ python -m unittest test_inventory_logic -v
 | *"Could not connect to PostgreSQL"* at start-up | Press **⚙ Settings** → correct host/port/database/user/password → **Test connection** → **Save & reconnect**. Run `python setup_db.py` if `inventory_db` does not exist yet |
 | Header shows *Ollama offline* | Start it with `ollama serve`, or fix the URL in Settings |
 | Parsing returns wrong or no items | Try a larger model in the *Model* drop-down; small models are less reliable. Verbs like *removed* or *bought* in the sentence help |
-| An item was merged into the wrong one | Use **⚙ Settings → Forget remembered choices**, or switch the mode to *Ask for every similar item* / raise *Confident match from (%)* |
+| An item was merged into the wrong one | Use **⚙ Settings → Forget remembered choices**, or switch the mode to *Ask for every similar item* / raise *Confident match from (%)*. In **⧉ Merge similar** choose *Keep as a separate item* for items that are different |
 | A removal did nothing | Read the ⚠ message: the item is not in the inventory, the units cannot be converted, or the name matched several items equally and you skipped it |
 | Items from older versions are duplicated (e.g. *yeast* and *yeast – 250 g*) | Press **⧉ Merge similar** to combine them |
 | `ModuleNotFoundError: tkinter` | Install Tkinter (`sudo apt install python3-tk` on Debian/Ubuntu) |
@@ -525,9 +602,11 @@ python -m unittest test_inventory_logic -v
 
 ## Known limitations
 
-- Fuzzy matching is name-based: a bare name contained in a longer one with the same last word scores as
-  a confident match, so *coconut milk* can be merged into *milk* in the default mode. Raise the
-  confident threshold or use *Ask for every similar item* if that is too eager.
+- Fuzzy matching is name-based: related names (*coconut milk* / *milk*, *kidney beans* / *beans*) are always
+  asked about, never merged silently, but the question appears every time unless you tick *Remember my
+  choice*.
+- The names dictionary is only as complete as you make it; unrelated local names (such as *pudina* and
+  *mint*) are not guessed.
 - Low-stock highlighting compares the raw number with one threshold regardless of unit.
 - The parsed *category* comes from the language model and may vary.
 - Only English sentences are tuned for.

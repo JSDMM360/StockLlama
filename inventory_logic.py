@@ -113,7 +113,14 @@ def fmt_qty(value):
 _LEADING_NOISE = re.compile(r"^(?:some|the|a|an|of|my|our)\s+", re.I)
 
 
+_IRREGULAR_PLURALS = {"leaves": "leaf", "loaves": "loaf", "halves": "half", "knives": "knife",
+                      "wolves": "wolf", "shelves": "shelf", "children": "child", "geese": "goose",
+                      "teeth": "tooth", "feet": "foot", "mice": "mouse"}
+
+
 def _singular(word):
+    if word in _IRREGULAR_PLURALS:
+        return _IRREGULAR_PLURALS[word]
     if len(word) > 4 and word.endswith("ies"):
         return word[:-3] + "y"
     if len(word) > 4 and word.endswith(("oes", "ches", "shes", "xes", "sses")):
@@ -144,11 +151,16 @@ def name_key(name):
 # "red rice" and "rice":
 #
 #   similarity()    scores two names from 0 to 1. The LAST word is the head noun (yeast, rice)
-#                   and counts three times as much as a modifier. A name whose words all appear
-#                   in a longer name with the same head noun ("rice" in "basmati rice") scores
-#                   about 0.9; two names with the same head but different modifiers ("basmati
-#                   rice" / "red rice") score about 0.6; a different head noun ("rice flour" /
-#                   "rice") is capped at 0.4, so it is treated as a different product.
+#                   and counts three times as much as a modifier.
+#                     1.00      the same words, allowing spelling variants and plurals, or names
+#                               the user's name dictionary lists as the same item (pudina = mint)
+#                     <= 0.80   a name whose words all appear in a longer name with the same
+#                               head noun ("rice" in "basmati rice", "beans" in "kidney beans")
+#                     ~ 0.60    same head noun, different modifiers ("basmati rice"/"red rice")
+#                     <= 0.40   a different head noun ("rice flour" / "rice")
+#                   Only the first case is ever "confident". Related-but-not-identical names are
+#                   always "ask the user", because kidney beans and mung beans are both beans and
+#                   still different items.
 #   decide_match()  turns the scores into a decision according to the matching mode.
 
 MODE_LEGACY = "legacy"            # only identical names merge; every variation is its own item
@@ -164,20 +176,53 @@ DEFAULT_AUTO_THRESHOLD = 0.85   # at or above: confident, merge without asking
 DEFAULT_ASK_THRESHOLD = 0.55    # at or above: similar enough to mention; below: a new item
 _HEAD_WEIGHT = 3
 _SAME_HEAD_FLOOR = 0.58
+_MAX_RELATED = 0.84            # best score of two names that are related but not the same
 
 
 def _fuzzy_equal(a, b):
     """Words are equal, or close enough to be a typo / spelling variant (yest ~ yeast)."""
     if a == b:
         return True
+    if a.startswith("§") or b.startswith("§"):      # dictionary tokens must match exactly
+        return False
     if min(len(a), len(b)) < 4:
         return False
     return SequenceMatcher(None, a, b).ratio() >= 0.84
 
 
-def similarity(name_a, name_b, category_a=None, category_b=None):
+def synonym_tokens(name, synonyms=None):
+    """
+    Like name_tokens(), but every word or phrase listed in the user's name dictionary is replaced
+    by a token for its group ("§12"), so "pudina leaves" and "mint leaves" become the same tokens.
+    `synonyms` maps a tuple of name tokens to a group id, e.g. {("pudina",): 12, ("mint",): 12}.
+    The longest matching phrase wins.
+    """
+    tokens = name_tokens(name)
+    if not synonyms:
+        return tokens
+    longest = max(len(k) for k in synonyms)
+    out, i = [], 0
+    while i < len(tokens):
+        for length in range(min(longest, len(tokens) - i), 0, -1):
+            group = synonyms.get(tuple(tokens[i:i + length]))
+            if group is not None:
+                out.append(f"§{group}")
+                i += length
+                break
+        else:
+            out.append(tokens[i])
+            i += 1
+    return out
+
+
+def canonical_key(name, synonyms=None):
+    """name_key() that also treats dictionary names as the same word."""
+    return " ".join(synonym_tokens(name, synonyms))
+
+
+def similarity(name_a, name_b, category_a=None, category_b=None, synonyms=None):
     """How likely two item names are the same kind of item (0.0 - 1.0)."""
-    ta, tb = name_tokens(name_a), name_tokens(name_b)
+    ta, tb = synonym_tokens(name_a, synonyms), synonym_tokens(name_b, synonyms)
     if not ta or not tb:
         return 0.0
     if ta == tb:
@@ -192,6 +237,9 @@ def similarity(name_a, name_b, category_a=None, category_b=None):
                 used.add(j)
                 pairs.append((i, j))
                 break
+    if len(pairs) == len(ta) == len(tb):                    # same words, spelling variants only
+        return 1.0
+
     inter = sum(max(wa[i], wb[j]) for i, j in pairs)
     union = sum(wa) + sum(wb) - inter
     score = inter / union if union else 0.0
@@ -200,14 +248,15 @@ def similarity(name_a, name_b, category_a=None, category_b=None):
         score = max(score, _SAME_HEAD_FLOOR)
         small, big = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
         if len(pairs) == len(small):                        # shorter name fully contained
-            score = max(score, 0.9 - 0.02 * max(len(big) - len(small) - 1, 0))
+            score = max(score, 0.80 - 0.02 * max(len(big) - len(small) - 1, 0))
     else:                                                   # different head noun: other product
         score = min(score, 0.4)
 
     ca, cb = (category_a or "").strip().lower(), (category_b or "").strip().lower()
     if ca and cb:
         score += 0.04 if ca == cb else -0.12
-    return max(0.0, min(1.0, score))
+    # Related names are never "identical": keep them below the confident threshold
+    return max(0.0, min(_MAX_RELATED, score))
 
 
 class Candidate:
@@ -245,12 +294,14 @@ def _rank(row, unit):
 
 def decide_match(rows, name, unit=None, category=None, aliases=None, distinct=None,
                  mode=MODE_PROMPT_LOW, auto_threshold=DEFAULT_AUTO_THRESHOLD,
-                 ask_threshold=DEFAULT_ASK_THRESHOLD):
+                 ask_threshold=DEFAULT_ASK_THRESHOLD, synonyms=None):
     """
     Decide which existing row (if any) an entry for `name` refers to.
 
     aliases   {name_key: row_id} choices remembered from earlier questions ("merge")
     distinct  {(row_id, name_key)} pairs the user said to keep separate
+    synonyms  the user's name dictionary {tuple(name tokens): group_id}; names of one group
+              (pudina = mint) count as the same name
     Only rows whose unit can be converted to `unit` are considered for fuzzy matches.
     """
     aliases, distinct = aliases or {}, distinct or set()
@@ -258,13 +309,16 @@ def decide_match(rows, name, unit=None, category=None, aliases=None, distinct=No
     if not key:
         return MatchDecision("new")
     by_id = {r["id"]: r for r in rows}
+    ckey = canonical_key(name, synonyms)
 
     if key in aliases and aliases[key] in by_id:
         return MatchDecision("exact", by_id[aliases[key]], 1.0, via="alias")
 
-    exact = [r for r in rows if name_key(r["item_name"]) == key]
+    exact = [r for r in rows if canonical_key(r["item_name"], synonyms) == ckey]
     if exact:
-        return MatchDecision("exact", sorted(exact, key=lambda r: _rank(r, unit))[0], 1.0)
+        best = sorted(exact, key=lambda r: _rank(r, unit))[0]
+        via = "name" if name_key(best["item_name"]) == key else "dictionary"
+        return MatchDecision("exact", best, 1.0, via=via)
 
     if mode == MODE_LEGACY:
         return MatchDecision("new")
@@ -275,7 +329,7 @@ def decide_match(rows, name, unit=None, category=None, aliases=None, distinct=No
             continue
         if not convert_quantity(1, unit, r.get("unit"))[1]:
             continue
-        score = similarity(name, r["item_name"], category, r.get("category"))
+        score = similarity(name, r["item_name"], category, r.get("category"), synonyms)
         if score >= ask_threshold:
             cands.append(Candidate(r, score))
     if not cands:
@@ -291,23 +345,34 @@ def decide_match(rows, name, unit=None, category=None, aliases=None, distinct=No
     return MatchDecision("ask", candidates=cands)
 
 
-def find_similar_groups(rows, threshold=DEFAULT_ASK_THRESHOLD):
+def find_similar_groups(rows, threshold=DEFAULT_ASK_THRESHOLD, distinct=None, synonyms=None):
     """
-    Group existing rows that look like the same item, for the "Merge similar items" tool.
+    Group existing rows that look alike, for the "Merge similar items" tool.
 
-    The shortest (most generic) name of a group is its suggested canonical row, and every other
-    member is compared with it, so unrelated items are not chained together.
+    A group is only a *suggestion*: its members share a head noun (all beans, all sauces) but may
+    well be different items, so the tool lets the user decide per item what to merge.
+    The shortest (most generic) name of a group is its representative and every other member is
+    compared with it, so unrelated items are not chained together.
+    `distinct` is a set of (row_id, name_key) pairs the user already said to keep separate;
+    such pairs are never grouped again. `synonyms` is the user's name dictionary, so items stored
+    under different names of one item ("mint" and "pudina") are grouped with a score of 1.0.
     Returns [{"canonical": row, "members": [{"row", "score", "mergeable"}]}], where
-    mergeable is False when the member's unit cannot be converted to the canonical unit.
+    mergeable is False when the member's unit cannot be converted to the representative's unit.
     """
+    distinct = distinct or set()
     ordered = sorted(rows, key=lambda r: (len(name_tokens(r["item_name"])), r["id"]))
     groups = []
     for r in ordered:
+        r_key = name_key(r["item_name"])
         best = None
         for g in groups:
             c = g["canonical"]
-            score = (1.0 if name_key(c["item_name"]) == name_key(r["item_name"])
-                     else similarity(r["item_name"], c["item_name"], r.get("category"), c.get("category")))
+            c_key = name_key(c["item_name"])
+            if (c["id"], r_key) in distinct or (r["id"], c_key) in distinct:
+                continue
+            score = (1.0 if canonical_key(c["item_name"], synonyms) == canonical_key(r["item_name"], synonyms)
+                     else similarity(r["item_name"], c["item_name"], r.get("category"),
+                                     c.get("category"), synonyms))
             if score >= threshold and (best is None or score > best[0]):
                 best = (score, g)
         if best:

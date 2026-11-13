@@ -1,0 +1,50 @@
+"""
+Starter name dictionary: common English names and the everyday Indian / regional names for the
+same ingredient. Loaded on request from the Names dialog ("Load starter names"), never
+automatically, and fully editable afterwards. Each entry is one group of names that mean the
+same item.
+"""
+
+STARTER_NAME_GROUPS = [
+    ["mint", "pudina"],
+    ["coriander", "cilantro", "dhania"],
+    ["turmeric", "haldi"],
+    ["cumin", "jeera", "zeera"],
+    ["ginger", "adrak"],
+    ["garlic", "lehsun", "lasun"],
+    ["onion", "pyaz", "pyaaz"],
+    ["potato", "aloo"],
+    ["tomato", "tamatar"],
+    ["spinach", "palak"],
+    ["cauliflower", "phool gobi"],
+    ["green peas", "matar"],
+    ["eggplant", "aubergine", "brinjal", "baingan"],
+    ["okra", "ladies finger", "lady finger", "bhindi"],
+    ["bottle gourd", "lauki", "dudhi"],
+    ["yogurt", "curd", "dahi"],
+    ["clarified butter", "ghee"],
+    ["cottage cheese", "paneer"],
+    ["rice", "chawal"],
+    ["wheat flour", "atta"],
+    ["all purpose flour", "maida", "plain flour", "refined flour"],
+    ["semolina", "sooji", "suji", "rava"],
+    ["chickpea", "garbanzo", "chana"],
+    ["green gram", "mung bean", "moong"],
+    ["black gram", "urad"],
+    ["pigeon pea", "toor", "arhar"],
+    ["red lentil", "masoor"],
+    ["peanut", "groundnut", "moongphali"],
+    ["sesame", "til"],
+    ["jaggery", "gur"],
+    ["tamarind", "imli"],
+    ["fenugreek", "methi"],
+    ["mustard seed", "rai"],
+    ["carom seed", "ajwain"],
+    ["asafoetida", "hing"],
+    ["curry leaf", "kadi patta"],
+    ["cardamom", "elaichi"],
+    ["cinnamon", "dalchini"],
+    ["clove", "laung"],
+    ["black pepper", "kali mirch"],
+    ["vermicelli", "seviyan"],
+]

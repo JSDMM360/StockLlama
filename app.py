@@ -16,7 +16,7 @@ from database import DatabaseManager
 from ollama_parser import OllamaParser
 from config import APP_CONFIG, DB_CONFIG, OLLAMA_CONFIG, MATCH_CONFIG, save_settings
 from inventory_logic import (
-    MATCH_MODES, MATCH_MODE_LABELS, convert_quantity, fmt_qty,
+    MATCH_MODES, MATCH_MODE_LABELS, convert_quantity, fmt_qty, name_key,
 )
 
 
@@ -496,112 +496,386 @@ class MatchPromptDialog(tk.Toplevel):
 
 class MergeSimilarDialog(tk.Toplevel):
     """
-    Lists groups of existing items that look like the same item (for example "yeast",
-    "active dry yeast", "instant dry yeast"), lets the user choose the item to keep for each
-    group, and merges the ticked groups: quantities are added up in the kept item's unit.
+    Review groups of existing items that have similar names.
+
+    A group is only a suggestion: "soya sauce" and "hot sauce", or "kidney beans", "mung beans"
+    and "red beans", look alike but are different items. So every item gets its own decision:
+    keep it as a separate item, or merge it into one of the other items of the group. Any
+    number of items per group can be kept, and several merges can happen inside one group.
+    Quantities of merged items are added up in the kept item's unit.
+
+    on_merge(jobs, separate_pairs) is called for the ticked groups:
+        jobs            [(kept_id, [merged_ids])]    what to merge
+        separate_pairs  [(id_a, id_b)]                kept items to remember as "different"
     """
+
+    KEEP = "Keep as a separate item"
 
     def __init__(self, parent, groups, auto_threshold, on_merge):
         super().__init__(parent, bg=COLORS["surface"])
         self.title("Merge similar items")
         self.transient(parent)
         self.on_merge = on_merge
-        self.geometry("680x560")
-        self.minsize(560, 420)
+        self.auto_threshold = auto_threshold
         self.groups = []
 
         tk.Label(self, text="⧉  MERGE SIMILAR ITEMS", bg=COLORS["surface"], fg=COLORS["accent"],
                  font=("Consolas", 14, "bold")).pack(anchor="w", padx=20, pady=(16, 2))
-        tk.Label(self, text="Tick the groups to merge and choose which item to keep. The other "
-                            "names are remembered,\nso future entries under those names update the "
-                            "kept item.",
+        tk.Label(self, text="Items in a group have similar names, but they are not necessarily the\n"
+                            "same item (soya sauce and hot sauce are both sauces). For each item choose\n"
+                            "to keep it separate or merge it into another item. Tick a group to apply it;\n"
+                            "items you keep separate are not suggested together again.",
                  bg=COLORS["surface"], fg=COLORS["text_dim"], font=("Consolas", 9),
                  justify="left").pack(anchor="w", padx=20, pady=(0, 8))
 
         bottom = tk.Frame(self, bg=COLORS["surface"])
         bottom.pack(side="bottom", fill="x", padx=20, pady=14)
         StyledButton(bottom, "Close", command=self.destroy, style="ghost").pack(side="right")
-        StyledButton(bottom, "Merge selected", command=self._merge,
+        StyledButton(bottom, "Apply ticked groups", command=self._merge,
                      style="success").pack(side="right", padx=(0, 8))
 
         scroll = ScrollableFrame(self, bg=COLORS["surface"])
         scroll.pack(fill="both", expand=True, padx=(20, 4))
+        self._scroll = scroll
         for g in groups:
-            self._add_group(scroll.inner, g, auto_threshold)
+            self._add_group(scroll.inner, g)
 
         self.update_idletasks()
-        x = parent.winfo_rootx() + max((parent.winfo_width() - 680) // 2, 0)
-        y = parent.winfo_rooty() + 40
-        self.geometry(f"680x560+{x}+{y}")
+        w, h = 760, 620
+        x = parent.winfo_rootx() + max((parent.winfo_width() - w) // 2, 0)
+        y = parent.winfo_rooty() + 30
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        self.minsize(640, 460)
         self.grab_set()
 
-    def _add_group(self, parent, g, auto_threshold):
+    # ── one group ──────────────────────────────────────────────────────────────
+
+    def _add_group(self, parent, g):
         canon = g["canonical"]
-        members = g["members"]
-        conf = min(m["score"] for m in members)
-        use = tk.BooleanVar(value=conf >= auto_threshold)
-        keep = tk.IntVar(value=canon["id"])
-        rows = [canon] + [m["row"] for m in members]
-        ok_flags = {canon["id"]: True, **{m["row"]["id"]: m["mergeable"] for m in members}}
+        rows = [canon] + [m["row"] for m in g["members"]]
+        score = {canon["id"]: 1.0, **{m["row"]["id"]: m["score"] for m in g["members"]}}
+        names = [r["item_name"].strip().lower() for r in rows]
+
+        def label_for(r):
+            suffix = f" (#{r['id']})" if names.count(r["item_name"].strip().lower()) > 1 else ""
+            return f"Merge into “{r['item_name']}”{suffix}"
+
+        label_to_id = {label_for(r): r["id"] for r in rows}
+        vars_ = {r["id"]: tk.StringVar(value=self.KEEP) for r in rows}
+        combos = {}
+        use = tk.BooleanVar(value=False)
+
+        def target(rid):
+            return label_to_id.get(vars_[rid].get())          # None = keep separate
+
+        def refresh(*_):
+            # An item that others are merged into cannot be merged away itself, and an item can
+            # only be merged into an item that is being kept: repeat until the choices are valid.
+            changed = True
+            while changed:
+                changed = False
+                choice = {r["id"]: target(r["id"]) for r in rows}
+                has_deps = {r["id"]: any(t == r["id"] for t in choice.values()) for r in rows}
+                for r in rows:
+                    rid = r["id"]
+                    options = [self.KEEP]
+                    if not has_deps[rid]:
+                        for t in rows:
+                            if (t["id"] != rid and choice[t["id"]] is None and
+                                    convert_quantity(1, r.get("unit"), t.get("unit"))[1]):
+                                options.append(label_for(t))
+                    combos[rid]["values"] = options
+                    if vars_[rid].get() not in options:
+                        vars_[rid].set(self.KEEP)
+                        changed = True
+            # result preview
+            choice = {r["id"]: target(r["id"]) for r in rows}
+            lines = []
+            for r in rows:
+                if choice[r["id"]] is not None:
+                    continue
+                total, absorbed = float(r["quantity"]), []
+                for o in rows:
+                    if choice[o["id"]] == r["id"]:
+                        value, _ok = convert_quantity(float(o["quantity"]), o.get("unit"), r.get("unit"))
+                        total += value
+                        absorbed.append(o["item_name"])
+                u = f" {r['unit']}" if r.get("unit") else ""
+                extra = f"   absorbs: {', '.join(absorbed)}" if absorbed else ""
+                lines.append(f"  → {r['item_name']}: {fmt_qty(total)}{u}{extra}")
+            summary.configure(text="Result:\n" + "\n".join(lines))
+
+        def suggest():
+            for r in rows:
+                rid = r["id"]
+                m = next((m for m in g["members"] if m["row"]["id"] == rid), None)
+                vars_[rid].set(label_for(canon) if (m and m["mergeable"] and
+                                                    m["score"] >= self.auto_threshold) else self.KEEP)
+            refresh()
+            use.set(any(target(r["id"]) is not None for r in rows))
+
+        def keep_all():
+            for r in rows:
+                vars_[r["id"]].set(self.KEEP)
+            refresh()
 
         frame = tk.Frame(parent, bg=COLORS["surface2"], highlightbackground=COLORS["border"],
                          highlightthickness=1)
         frame.pack(fill="x", pady=5, padx=(0, 12))
+        summary = tk.Label(frame, text="", bg=COLORS["surface2"], fg=COLORS["accent3"],
+                           font=("Consolas", 9), justify="left", anchor="w")
         head = tk.Frame(frame, bg=COLORS["surface2"])
-        head.pack(fill="x", padx=10, pady=(8, 2))
-        tk.Checkbutton(head, text="Merge this group", variable=use, bg=COLORS["surface2"],
+        head.pack(fill="x", padx=10, pady=(8, 4))
+        tk.Checkbutton(head, text="Apply this group", variable=use, bg=COLORS["surface2"],
                        fg=COLORS["text"], selectcolor=COLORS["surface"],
                        activebackground=COLORS["surface2"], activeforeground=COLORS["text"],
                        font=("Consolas", 10, "bold"), highlightthickness=0).pack(side="left")
-        tk.Label(head, text=f"{int(round(conf * 100))}% similar", bg=COLORS["surface2"],
-                 fg=COLORS["accent2"] if conf >= auto_threshold else COLORS["warning"],
-                 font=("Consolas", 9)).pack(side="right")
-        tk.Label(frame, text="Keep:", bg=COLORS["surface2"], fg=COLORS["text_dim"],
-                 font=("Consolas", 8)).pack(anchor="w", padx=12)
-
-        result = tk.Label(frame, text="", bg=COLORS["surface2"], fg=COLORS["accent3"],
-                          font=("Consolas", 9))
-
-        def preview(*_):
-            kept = next(r for r in rows if r["id"] == keep.get())
-            total, merged = float(kept["quantity"]), 0
-            for r in rows:
-                if r["id"] == kept["id"]:
-                    continue
-                value, ok = convert_quantity(float(r["quantity"]), r.get("unit"), kept.get("unit"))
-                if ok:
-                    total += value
-                    merged += 1
-            u = f" {kept['unit']}" if kept.get("unit") else ""
-            result.configure(text=f"→ “{kept['item_name']}”: {fmt_qty(total)}{u}  "
-                                  f"({merged} item(s) merged in)")
+        StyledButton(head, "Keep all separate", command=keep_all, style="ghost",
+                     padx=8, pady=2).pack(side="right", padx=(6, 0))
+        StyledButton(head, "Suggestion", command=suggest, style="ghost",
+                     padx=8, pady=2).pack(side="right")
 
         for r in rows:
             line = tk.Frame(frame, bg=COLORS["surface2"])
-            line.pack(fill="x", padx=12)
-            tk.Radiobutton(line, text=r["item_name"], variable=keep, value=r["id"],
-                           command=preview, bg=COLORS["surface2"], fg=COLORS["text"],
-                           selectcolor=COLORS["surface"], activebackground=COLORS["surface2"],
-                           activeforeground=COLORS["text"], font=("Consolas", 10),
-                           highlightthickness=0, anchor="w").pack(side="left")
+            line.pack(fill="x", padx=12, pady=2)
             have = f"{fmt_qty(r['quantity'])} {r.get('unit') or ''}".strip()
-            note = have if ok_flags[r["id"]] else f"{have}  (different unit - left as is)"
-            tk.Label(line, text=note, bg=COLORS["surface2"],
-                     fg=COLORS["text_dim"] if ok_flags[r["id"]] else COLORS["warning"],
-                     font=("Consolas", 9)).pack(side="right")
-        result.pack(anchor="w", padx=12, pady=(4, 8))
-        preview()
-        self.groups.append({"use": use, "keep": keep, "rows": rows})
+            tk.Label(line, text=f"{r['item_name']}", bg=COLORS["surface2"], fg=COLORS["text"],
+                     font=("Consolas", 10, "bold"), width=22, anchor="w").pack(side="left")
+            tk.Label(line, text=have, bg=COLORS["surface2"], fg=COLORS["text_dim"],
+                     font=("Consolas", 9), width=11, anchor="w").pack(side="left")
+            pct = "" if r is canon else f"{int(round(score[r['id']] * 100))}%"
+            tk.Label(line, text=pct, bg=COLORS["surface2"], fg=COLORS["text_dim"],
+                     font=("Consolas", 9), width=5, anchor="e").pack(side="left")
+            combo = ttk.Combobox(line, textvariable=vars_[r["id"]], state="readonly", width=34,
+                                 font=("Consolas", 9))
+            combo.pack(side="right")
+            combo.bind("<<ComboboxSelected>>", refresh)
+            combos[r["id"]] = combo
+            self._scroll.capture_wheel(combo)      # wheel scrolls the list, not the drop-down
+        summary.pack(fill="x", padx=12, pady=(6, 8))
+        suggest()
+        self.groups.append({"use": use, "rows": rows, "target": target, "vars": vars_,
+                            "combos": combos, "refresh": refresh, "label_for": label_for})
+
+    # ── apply ──────────────────────────────────────────────────────────────────
 
     def _merge(self):
-        jobs = []
+        jobs, pairs = [], []
         for g in self.groups:
-            if g["use"].get():
-                keep = g["keep"].get()
-                jobs.append((keep, [r["id"] for r in g["rows"] if r["id"] != keep]))
+            if not g["use"].get():
+                continue
+            rows, target = g["rows"], g["target"]
+            keepers = [r["id"] for r in rows if target(r["id"]) is None]
+            for k in keepers:
+                deps = [r["id"] for r in rows if target(r["id"]) == k]
+                if deps:
+                    jobs.append((k, deps))
+            for i, a in enumerate(keepers):
+                for b in keepers[i + 1:]:
+                    pairs.append((a, b))
         self.destroy()
-        if jobs:
-            self.on_merge(jobs)
+        if jobs or pairs:
+            self.on_merge(jobs, pairs)
+
+
+class NamesDialog(tk.Toplevel):
+    """
+    The name dictionary: several names that mean the same item ("mint" = "pudina", "curd" =
+    "yogurt"), including everyday local names. Names of one group are treated as one item
+    everywhere: a new entry under any of them updates the item that is stored under another.
+    Names can be added before or after the items exist.
+    """
+
+    def __init__(self, parent, db, prefill=None, on_close=None):
+        super().__init__(parent, bg=COLORS["surface"])
+        self.title("Names dictionary")
+        self.transient(parent)
+        self.db = db
+        self.on_close = on_close
+        self.changed = False
+        self.groups = []
+        self.current = None
+
+        tk.Label(self, text="📖  NAMES DICTIONARY", bg=COLORS["surface"], fg=COLORS["accent"],
+                 font=("Consolas", 14, "bold")).pack(anchor="w", padx=20, pady=(16, 2))
+        tk.Label(self, text="Some items have more than one name (mint / pudina, curd / yogurt). Names in\n"
+                            "the same group are treated as ONE item: an entry under any of them\n"
+                            "updates the item stored under another.",
+                 bg=COLORS["surface"], fg=COLORS["text_dim"], font=("Consolas", 9),
+                 justify="left").pack(anchor="w", padx=20, pady=(0, 8))
+
+        bottom = tk.Frame(self, bg=COLORS["surface"])
+        bottom.pack(side="bottom", fill="x", padx=20, pady=(8, 14))
+        StyledButton(bottom, "Close", command=self._close, style="ghost").pack(side="right")
+        StyledButton(bottom, "Load starter names", command=self._load_starter,
+                     style="ghost").pack(side="left")
+
+        new = tk.Frame(self, bg=COLORS["surface"])
+        new.pack(side="bottom", fill="x", padx=20, pady=(6, 0))
+        tk.Label(new, text="NEW GROUP - names separated by commas (e.g. mint, pudina)",
+                 bg=COLORS["surface"], fg=COLORS["text_dim"], font=("Consolas", 8, "bold")
+                 ).pack(anchor="w")
+        row = tk.Frame(new, bg=COLORS["surface"])
+        row.pack(fill="x", pady=(2, 0))
+        self.new_var = tk.StringVar(value=(prefill + ", " if prefill else ""))
+        self.new_entry = self._entry(row, self.new_var)
+        self.new_entry.pack(side="left", fill="x", expand=True)
+        StyledButton(row, "Create group", command=self._create, style="success",
+                     padx=10, pady=5).pack(side="left", padx=(8, 0))
+
+        body = tk.Frame(self, bg=COLORS["surface"])
+        body.pack(fill="both", expand=True, padx=20)
+        left = tk.Frame(body, bg=COLORS["surface"])
+        left.pack(side="left", fill="both", expand=True)
+        tk.Label(left, text="GROUPS", bg=COLORS["surface"], fg=COLORS["text_dim"],
+                 font=("Consolas", 8, "bold")).pack(anchor="w")
+        self.group_list = self._listbox(left, 44)
+        right = tk.Frame(body, bg=COLORS["surface"])
+        right.pack(side="left", fill="both", expand=True, padx=(14, 0))
+        tk.Label(right, text="NAMES OF THE SELECTED GROUP", bg=COLORS["surface"], fg=COLORS["text_dim"],
+                 font=("Consolas", 8, "bold")).pack(anchor="w")
+        self.name_list = self._listbox(right, 30, height=7)
+        add = tk.Frame(right, bg=COLORS["surface"])
+        add.pack(fill="x", pady=(6, 0))
+        self.add_var = tk.StringVar()
+        self._entry(add, self.add_var).pack(side="left", fill="x", expand=True)
+        StyledButton(add, "Add name", command=self._add_name, style="primary",
+                     padx=10, pady=5).pack(side="left", padx=(8, 0))
+        btns = tk.Frame(right, bg=COLORS["surface"])
+        btns.pack(fill="x", pady=(6, 0))
+        StyledButton(btns, "Remove name", command=self._remove_name, style="ghost",
+                     padx=10, pady=4).pack(side="left")
+        StyledButton(btns, "Delete group", command=self._delete_group, style="danger",
+                     padx=10, pady=4).pack(side="left", padx=(8, 0))
+        tk.Label(right, text="IN YOUR INVENTORY", bg=COLORS["surface"], fg=COLORS["text_dim"],
+                 font=("Consolas", 8, "bold")).pack(anchor="w", pady=(10, 0))
+        self.items_label = tk.Label(right, text="", bg=COLORS["surface"], fg=COLORS["accent3"],
+                                    font=("Consolas", 9), justify="left", anchor="w", wraplength=300)
+        self.items_label.pack(fill="x")
+
+        self.group_list.bind("<<ListboxSelect>>", self._on_select)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.bind("<Escape>", lambda e: self._close())
+        self._reload(select_name=prefill)
+
+        self.update_idletasks()
+        w, h = 860, 600
+        x = parent.winfo_rootx() + max((parent.winfo_width() - w) // 2, 0)
+        y = parent.winfo_rooty() + 30
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        self.minsize(760, 520)
+        self.grab_set()
+        self.new_entry.focus_set()
+
+    # ── small widget helpers ──
+    def _entry(self, parent, var):
+        return tk.Entry(parent, textvariable=var, bg=COLORS["surface2"], fg=COLORS["text"],
+                        insertbackground=COLORS["accent"], font=("Consolas", 10), relief="flat",
+                        bd=6, highlightbackground=COLORS["border"], highlightthickness=1)
+
+    def _listbox(self, parent, width, height=12):
+        frame = tk.Frame(parent, bg=COLORS["surface"])
+        frame.pack(fill="both", expand=True)
+        lb = tk.Listbox(frame, width=width, height=height, exportselection=False,
+                        bg=COLORS["surface2"], fg=COLORS["text"], font=("Consolas", 10),
+                        selectbackground=COLORS["accent"], selectforeground="#0D1117",
+                        highlightbackground=COLORS["border"], highlightthickness=1, relief="flat",
+                        activestyle="none")
+        sb = ttk.Scrollbar(frame, orient="vertical", command=lb.yview)
+        lb.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        lb.pack(side="left", fill="both", expand=True)
+        return lb
+
+    # ── data ──
+    def _reload(self, select_id=None, select_name=None):
+        self.groups = self.db.get_name_groups()
+        self.group_list.delete(0, "end")
+        pick = None
+        for i, g in enumerate(self.groups):
+            mark = "● " if g["items"] else "  "
+            self.group_list.insert("end", mark + " = ".join(n["display_name"] for n in g["names"]))
+            if select_id is not None and g["id"] == select_id:
+                pick = i
+            if select_name and any(n["name_key"] == name_key(select_name) for n in g["names"]):
+                pick = i
+        if pick is not None:
+            self.group_list.selection_set(pick)
+            self.group_list.see(pick)
+        self._on_select()
+
+    def _on_select(self, *_):
+        sel = self.group_list.curselection()
+        self.current = self.groups[sel[0]] if sel else None
+        self.name_list.delete(0, "end")
+        if self.current:
+            for n in self.current["names"]:
+                self.name_list.insert("end", n["display_name"])
+            items = self.current["items"]
+            self.items_label.configure(
+                text="\n".join(f"{r['item_name']}: {fmt_qty(r['quantity'])} {r.get('unit') or ''}".strip()
+                               for r in items) or "(no item is stored under these names yet)")
+        else:
+            self.items_label.configure(text="")
+
+    def _warn(self, text):
+        messagebox.showwarning("Names dictionary", text, parent=self)
+
+    def _create(self):
+        names = [n.strip() for n in self.new_var.get().split(",") if n.strip()]
+        try:
+            gid = self.db.add_name_group(names)
+        except ValueError as e:
+            self._warn(str(e))
+            return
+        self.changed = True
+        self.new_var.set("")
+        self._reload(select_id=gid)
+
+    def _add_name(self):
+        if not self.current:
+            self._warn("Select a group first, or create a new one below.")
+            return
+        try:
+            self.db.add_name_to_group(self.current["id"], self.add_var.get())
+        except ValueError as e:
+            self._warn(str(e))
+            return
+        self.changed = True
+        self.add_var.set("")
+        self._reload(select_id=self.current["id"])
+
+    def _remove_name(self):
+        sel = self.name_list.curselection()
+        if not (self.current and sel):
+            return
+        self.db.remove_name(self.current["names"][sel[0]]["name_key"])
+        self.changed = True
+        self._reload(select_id=self.current["id"])
+
+    def _delete_group(self):
+        if not self.current:
+            return
+        if messagebox.askyesno("Delete group", "Delete this group of names? Your inventory items are not "
+                               "touched.", parent=self):
+            self.db.delete_name_group(self.current["id"])
+            self.changed = True
+            self._reload()
+
+    def _load_starter(self):
+        if messagebox.askyesno(
+                "Load starter names",
+                "Add a list of common names (for example mint = pudina, yogurt = curd, turmeric = "
+                "haldi)? Existing groups are kept and you can edit or delete any of them.", parent=self):
+            n = self.db.load_starter_names()
+            self.changed = True
+            self._reload()
+            messagebox.showinfo("Names dictionary", f"{n} group(s) added.", parent=self)
+
+    def _close(self):
+        self.destroy()
+        if self.on_close:
+            self.on_close(self.changed)
 
 
 class InventoryApp:
@@ -929,6 +1203,9 @@ class InventoryApp:
 
         StyledButton(toolbar, "⧉ Merge similar",
             command=self._open_merge_similar, style="ghost").pack(side="left", padx=4)
+
+        StyledButton(toolbar, "📖 Names",
+            command=self._open_names, style="ghost").pack(side="left", padx=4)
 
         StyledButton(toolbar, "🗑 Delete",
             command=self._delete_item, style="danger").pack(side="right", padx=4)
@@ -1312,6 +1589,34 @@ class InventoryApp:
         self.root.wait_window(dlg)
         return dlg.result
 
+    def _open_names(self):
+        """Open the names dictionary, starting at the selected item's group (or a new group for it)."""
+        if not self.db:
+            messagebox.showerror("DB Error", "Database not connected.")
+            return
+        prefill = None
+        sel = self.tree.selection()
+        if sel:
+            prefill = str(self.tree.item(sel[0])["values"][1])
+        NamesDialog(self.root, self.db, prefill=prefill, on_close=self._after_names)
+
+    def _after_names(self, changed):
+        """After editing the dictionary: offer to merge items that now share a name."""
+        if not changed:
+            return
+        self._refresh_table()
+        try:
+            groups = self.db.find_similar_groups()
+        except Exception:
+            return
+        auto = float(MATCH_CONFIG["auto_threshold"])
+        confident = [g for g in groups if any(m["score"] >= auto for m in g["members"])]
+        if confident and messagebox.askyesno(
+                "Items now share a name",
+                "Some items in your inventory are stored under different names of the same item "
+                "(for example \"Mint\" and \"Pudina\"). Review and merge them now?"):
+            self._open_merge_similar()
+
     def _open_merge_similar(self):
         if not self.db:
             messagebox.showerror("DB Error", "Database not connected.")
@@ -1328,9 +1633,11 @@ class InventoryApp:
         MergeSimilarDialog(self.root, groups, float(MATCH_CONFIG["auto_threshold"]),
                            on_merge=self._do_merge)
 
-    def _do_merge(self, jobs):
-        merged_total, skipped = 0, []
+    def _do_merge(self, jobs, separate_pairs=()):
+        merged_total, skipped, kept = 0, [], 0
         try:
+            if separate_pairs:
+                kept = self.db.mark_items_distinct(separate_pairs)
             for keep, members in jobs:
                 out = self.db.merge_items(keep, members)
                 merged_total += len(out["merged"])
@@ -1341,6 +1648,8 @@ class InventoryApp:
         self._refresh_table()
         self._refresh_stats()
         text = f"✓ Merged {merged_total} item(s)"
+        if kept:
+            text += f", {kept} pair(s) kept separate"
         if skipped:
             text += f"; left {len(skipped)} with a different unit"
         self._set_status(text, COLORS["warning"] if skipped else COLORS["accent2"])

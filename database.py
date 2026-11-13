@@ -9,8 +9,9 @@ from datetime import datetime, date
 from config import DB_CONFIG, MATCH_CONFIG
 from inventory_logic import (
     ACTION_ADD, ACTION_REMOVE, ACTION_SET, normalize_action, normalize_unit,
-    convert_quantity, decide_match, find_similar_groups, fmt_qty, name_key,
+    convert_quantity, decide_match, find_similar_groups, fmt_qty, name_key, name_tokens,
 )
+from default_names import STARTER_NAME_GROUPS
 
 
 class DatabaseManager:
@@ -69,6 +70,21 @@ class DatabaseManager:
                     inventory_id INTEGER NOT NULL REFERENCES inventory(id) ON DELETE CASCADE,
                     name_key     TEXT NOT NULL,
                     PRIMARY KEY (inventory_id, name_key)
+                )
+            """)
+            # Name dictionary: several names for one item (mint = pudina). Not tied to a row, so it
+            # keeps working when rows are added or deleted.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS name_groups (
+                    id    SERIAL PRIMARY KEY,
+                    label TEXT NOT NULL
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS name_group_names (
+                    name_key     TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    group_id     INTEGER NOT NULL REFERENCES name_groups(id) ON DELETE CASCADE
                 )
             """)
             # Older databases stored 2 decimals; widen so that conversions such as 5 g -> 0.005 kg
@@ -218,8 +234,9 @@ class DatabaseManager:
             aliases = {r["alias_key"]: r["inventory_id"] for r in cur.fetchall()}
             cur.execute("SELECT inventory_id, name_key FROM item_distinct")
             distinct = {(r["inventory_id"], r["name_key"]) for r in cur.fetchall()}
+            synonyms = self._synonym_map(cur)
         return decide_match(rows, item.get("item_name"), normalize_unit(item.get("unit")),
-                            item.get("category"), aliases, distinct, mode, auto, ask)
+                            item.get("category"), aliases, distinct, mode, auto, ask, synonyms)
 
     def apply_stock_change(self, item: dict, chooser=None) -> dict:
         """
@@ -409,15 +426,169 @@ class DatabaseManager:
             cur.execute("DELETE FROM item_distinct")
         return n
 
+    # ── Name dictionary (several names for one item) ───────────────────────────
+
+    @staticmethod
+    def _synonym_map(cur) -> dict:
+        """{tuple(name tokens): group_id} for every name in the dictionary."""
+        cur.execute("SELECT name_key, group_id FROM name_group_names")
+        return {tuple(r["name_key"].split()): r["group_id"] for r in cur.fetchall()}
+
+    def synonym_map(self) -> dict:
+        with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+            return self._synonym_map(cur)
+
+    def get_name_groups(self) -> list:
+        """
+        All dictionary groups: [{"id", "label", "names": [{"name_key", "display_name"}],
+        "items": [inventory rows stored under one of these names]}].
+        """
+        with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id, label FROM name_groups ORDER BY LOWER(label)")
+            groups = {r["id"]: {"id": r["id"], "label": r["label"], "names": [], "items": []}
+                      for r in cur.fetchall()}
+            cur.execute("SELECT name_key, display_name, group_id FROM name_group_names ORDER BY display_name")
+            owner = {}
+            for r in cur.fetchall():
+                groups[r["group_id"]]["names"].append(
+                    {"name_key": r["name_key"], "display_name": r["display_name"]})
+                owner[tuple(r["name_key"].split())] = r["group_id"]
+            cur.execute("SELECT id, item_name, quantity, unit FROM inventory ORDER BY item_name")
+            for row in cur.fetchall():
+                gid = owner.get(tuple(name_tokens(row["item_name"])))
+                if gid in groups:
+                    groups[gid]["items"].append(dict(row))
+        return list(groups.values())
+
+    def find_name_group(self, name: str):
+        """The dictionary group that contains `name` (a dict as in get_name_groups) or None."""
+        key = name_key(name)
+        for g in self.get_name_groups():
+            if any(n["name_key"] == key for n in g["names"]):
+                return g
+        return None
+
+    def add_name_group(self, names, label=None) -> int:
+        """
+        Declare that all of `names` mean the same item. Names already in the dictionary pull
+        their whole group in, so overlapping groups are folded into one (adding "mint, spearmint"
+        to a group that already holds "pudina" gives one group "pudina, mint, spearmint").
+        Returns the id of the resulting group.
+        """
+        cleaned, seen = [], set()
+        for n in names:
+            n = " ".join(str(n or "").split())
+            k = name_key(n)
+            if k and k not in seen:
+                seen.add(k)
+                cleaned.append((k, n))
+        if len(cleaned) < 2:
+            raise ValueError("Enter at least two different names for the same item.")
+        with self._transaction() as cur:
+            cur.execute("SELECT DISTINCT group_id FROM name_group_names WHERE name_key = ANY(%s)",
+                        ([k for k, _ in cleaned],))
+            existing = sorted(r["group_id"] for r in cur.fetchall())
+            if existing:
+                target = existing[0]
+                for other in existing[1:]:
+                    cur.execute("UPDATE name_group_names SET group_id = %s WHERE group_id = %s",
+                                (target, other))
+                    cur.execute("DELETE FROM name_groups WHERE id = %s", (other,))
+                if label:
+                    cur.execute("UPDATE name_groups SET label = %s WHERE id = %s", (label.strip(), target))
+            else:
+                cur.execute("INSERT INTO name_groups (label) VALUES (%s) RETURNING id",
+                            ((label or cleaned[0][1]).strip(),))
+                target = cur.fetchone()["id"]
+            for k, n in cleaned:
+                cur.execute("""
+                    INSERT INTO name_group_names (name_key, display_name, group_id) VALUES (%s, %s, %s)
+                    ON CONFLICT (name_key) DO NOTHING
+                """, (k, n, target))
+        return target
+
+    def add_name_to_group(self, group_id: int, name: str):
+        """Add one more name to an existing group. A name can belong to one group only."""
+        n = " ".join(str(name or "").split())
+        k = name_key(n)
+        if not k:
+            raise ValueError("The name is empty.")
+        with self._transaction() as cur:
+            cur.execute("SELECT g.label FROM name_group_names x JOIN name_groups g ON g.id = x.group_id "
+                        "WHERE x.name_key = %s", (k,))
+            found = cur.fetchone()
+            if found:
+                raise ValueError(f"'{n}' is already a name of the group '{found['label']}'.")
+            cur.execute("INSERT INTO name_group_names (name_key, display_name, group_id) VALUES (%s, %s, %s)",
+                        (k, n, group_id))
+
+    def remove_name(self, name_key_value: str):
+        """Remove one name from the dictionary; a group left with a single name is deleted."""
+        with self._transaction() as cur:
+            cur.execute("DELETE FROM name_group_names WHERE name_key = %s RETURNING group_id",
+                        (name_key_value,))
+            gone = cur.fetchone()
+            if gone:
+                cur.execute("SELECT COUNT(*) AS n FROM name_group_names WHERE group_id = %s",
+                            (gone["group_id"],))
+                if cur.fetchone()["n"] < 2:
+                    cur.execute("DELETE FROM name_groups WHERE id = %s", (gone["group_id"],))
+
+    def delete_name_group(self, group_id: int):
+        with self._transaction() as cur:
+            cur.execute("DELETE FROM name_groups WHERE id = %s", (group_id,))
+
+    def load_starter_names(self) -> int:
+        """Add the built-in list of common regional names (default_names.py). Returns groups added."""
+        added = 0
+        for names in STARTER_NAME_GROUPS:
+            try:
+                self.add_name_group(names, label=names[0])
+                added += 1
+            except ValueError:
+                pass
+        return added
+
     # ── Merging items that already exist ───────────────────────────────────────
 
     def find_similar_groups(self):
-        """Groups of existing rows that look like the same item (see find_similar_groups)."""
+        """
+        Groups of existing rows that look alike (see inventory_logic.find_similar_groups).
+        Pairs the user already marked as "keep separate" are not suggested again.
+        """
         _, _, ask = self._match_settings()
         with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT * FROM inventory ORDER BY id")
             rows = [dict(r) for r in cur.fetchall()]
-        return find_similar_groups(rows, ask)
+            cur.execute("SELECT inventory_id, name_key FROM item_distinct")
+            distinct = {(r["inventory_id"], r["name_key"]) for r in cur.fetchall()}
+            synonyms = self._synonym_map(cur)
+        return find_similar_groups(rows, ask, distinct, synonyms)
+
+    def mark_items_distinct(self, pairs) -> int:
+        """
+        Remember that these pairs of existing items are different products ("soya sauce" and
+        "hot sauce"): they are not suggested for merging again and a new entry for one of them is
+        never matched to the other. `pairs` is an iterable of (row_id_a, row_id_b).
+        Returns the number of pairs recorded.
+        """
+        pairs = {tuple(sorted(p)) for p in pairs if p[0] != p[1]}
+        if not pairs:
+            return 0
+        ids = sorted({i for p in pairs for i in p})
+        with self._transaction() as cur:
+            cur.execute("SELECT id, item_name FROM inventory WHERE id = ANY(%s)", (ids,))
+            names = {r["id"]: r["item_name"] for r in cur.fetchall()}
+            count = 0
+            for a, b in pairs:
+                if a in names and b in names:
+                    for owner, other in ((a, b), (b, a)):
+                        cur.execute("""
+                            INSERT INTO item_distinct (inventory_id, name_key) VALUES (%s, %s)
+                            ON CONFLICT DO NOTHING
+                        """, (owner, name_key(names[other])))
+                    count += 1
+        return count
 
     def merge_items(self, canonical_id: int, member_ids: list) -> dict:
         """
