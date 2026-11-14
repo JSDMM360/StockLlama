@@ -148,12 +148,39 @@ def _chunks(audio, seconds=30):
             yield part
 
 
+def _prefetch_hf(repo_id: str, progress):
+    """Download a Hub model up-front so we can report progress. Best effort:
+    any problem here is ignored and from_pretrained() downloads it instead."""
+    try:
+        from huggingface_hub import snapshot_download
+        from huggingface_hub.utils import tqdm as hf_tqdm
+    except Exception:
+        return
+
+    class _Bar(hf_tqdm):
+        def update(self, n=1):
+            out = super().update(n)
+            try:
+                if self.total:
+                    progress(int(self.n), int(self.total))
+            except Exception:
+                pass
+            return out
+
+    try:
+        snapshot_download(repo_id, tqdm_class=_Bar)
+    except Exception:
+        pass
+
+
 class _HFBackend:
-    def __init__(self, model: SttModel):
+    def __init__(self, model: SttModel, progress=None):
         import torch
         from transformers import WhisperForConditionalGeneration, WhisperProcessor
         self.torch = torch
         self.multilingual = model.multilingual
+        if progress and not Path(model.source).exists():
+            _prefetch_hf(model.source, progress)
         try:
             self.processor = WhisperProcessor.from_pretrained(model.source)
         except Exception:
@@ -185,7 +212,7 @@ class _HFBackend:
 
 
 class _FasterBackend:
-    def __init__(self, model: SttModel):
+    def __init__(self, model: SttModel, progress=None):
         from faster_whisper import WhisperModel
         try:
             import ctranslate2
@@ -213,7 +240,7 @@ class _GGMLBackend:
     """
     CTX_MARGIN = 128
 
-    def __init__(self, model: SttModel):
+    def __init__(self, model: SttModel, progress=None):
         from pywhispercpp.model import Model
         self.model = Model(model.source)
         self.acft = model.acft
@@ -233,6 +260,19 @@ class _GGMLBackend:
 
 
 _BACKENDS = {"hf": _HFBackend, "faster": _FasterBackend, "ggml": _GGMLBackend}
+
+
+def explain_load_error(model: SttModel, exc: Exception) -> str:
+    text = f"{type(exc).__name__}: {exc}"
+    lowered = text.lower()
+    if any(w in lowered for w in ("connection", "resolve", "max retries", "timed out",
+                                  "offline", "network", "couldn't connect",
+                                  "can't load the", "not a local folder")):
+        first = str(exc).splitlines()[0][:120] if str(exc) else type(exc).__name__
+        return (f"Could not download '{model.label.strip()}'. Check your internet "
+                f"connection and try again, or copy a model into models/stt/ to use it "
+                f"offline. ({first})")
+    return f"Could not load '{model.label.strip()}': {text[:200]}"
 
 
 # ── public API ────────────────────────────────────────────────────────────────
@@ -257,7 +297,7 @@ class SpeechRecognizer:
     def loaded_key(self) -> Optional[str]:
         return self.model.key if self.model else None
 
-    def load(self, model_or_key) -> SttModel:
+    def load(self, model_or_key, progress=None) -> SttModel:
         """Load a model given an SttModel, a registry key, a path or an HF id."""
         model = (model_or_key if isinstance(model_or_key, SttModel)
                  else find_model(model_or_key))
@@ -267,7 +307,10 @@ class SpeechRecognizer:
         with self._lock:
             if self.model and self.model.key == model.key and self._backend:
                 return model
-            self._backend = _BACKENDS[model.backend](model)
+            try:
+                self._backend = _BACKENDS[model.backend](model, progress)
+            except Exception as exc:
+                raise RuntimeError(explain_load_error(model, exc)) from exc
             self.model = model
         return model
 
@@ -285,37 +328,65 @@ class SpeechRecognizer:
 
 
 class MicRecorder:
-    """Push-to-toggle microphone capture at 16 kHz mono."""
+    """Microphone capture at 16 kHz mono, with a live input level."""
+    MAX_SECONDS = 120
 
     def __init__(self):
         self._frames = []
         self._stream = None
+        self._started = 0.0
+        self.level = 0.0            # RMS of the latest audio block
 
     @property
     def recording(self) -> bool:
         return self._stream is not None
 
+    @property
+    def elapsed(self) -> float:
+        return time.time() - self._started if self._stream is not None else 0.0
+
     def start(self):
         try:
+            import numpy as np
             import sounddevice as sd
         except ImportError as exc:
             raise RuntimeError("Recording needs:  pip install sounddevice numpy") from exc
+        except OSError as exc:       # PortAudio library missing
+            raise RuntimeError(
+                f"The audio library could not be loaded ({exc}). On Linux install it "
+                f"with:  sudo apt install libportaudio2") from exc
+        try:
+            sd.query_devices(kind="input")
+        except Exception as exc:
+            raise RuntimeError("No microphone found. Connect or enable an input "
+                               "device and try again.") from exc
         self._frames = []
+        self.level = 0.0
 
         def _cb(indata, _frames, _time, _status):
             self._frames.append(indata.copy())
+            self.level = float(np.sqrt(np.mean(np.square(indata))))
 
-        self._stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
-                                      dtype="float32", callback=_cb)
-        self._stream.start()
+        try:
+            self._stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
+                                          dtype="float32", callback=_cb)
+            self._stream.start()
+        except Exception as exc:
+            self._stream = None
+            raise RuntimeError(f"Could not open the microphone: {exc}") from exc
+        self._started = time.time()
 
     def stop(self):
         """Stop and return the audio as a 1-D float32 numpy array."""
         import numpy as np
         if self._stream is not None:
-            self._stream.stop()
-            self._stream.close()
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
             self._stream = None
+        self.level = 0.0
         if not self._frames:
             return np.zeros(0, dtype="float32")
         return np.concatenate(self._frames).reshape(-1).astype("float32")

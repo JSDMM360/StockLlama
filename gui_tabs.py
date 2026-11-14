@@ -17,7 +17,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
-from activity_log import ActivityLogger
+from activity_log import ActivityLogger, format_ms
 from charts import CHART_TYPES, build_figures, build_ingredients
 import bulk_parse
 import stt_engine
@@ -383,9 +383,11 @@ class ChartsTab(tk.Frame):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Logs
+# Event Logs
 # ══════════════════════════════════════════════════════════════════════════════
 class LogsTab(tk.Frame):
+    """Event Logs tab: every input with its model output, model, inference time,
+    token usage and the events that followed. Backed by PostgreSQL (event_logs)."""
     STATUS_COLOR = {"error": "error", "saved": "success", "updated": "success",
                     "deleted": "accent3", "awaiting save": "warning",
                     "discarded": "text_dimmer", "no items": "warning",
@@ -401,7 +403,8 @@ class LogsTab(tk.Frame):
         self.c = colors
         self.logger = logger
         self._entries: dict[str, dict] = {}
-        self._dirty = threading.Event()     # set from any thread, read on Tk thread
+        self._dirty = threading.Event()     # set from the writer thread
+        self._ticks = 0
         logger.add_listener(lambda _eid: self._dirty.set())
         self._build()
         self.refresh()
@@ -410,7 +413,7 @@ class LogsTab(tk.Frame):
     def _build(self):
         c = self.c
         bar = tk.Frame(self, bg=c["bg"])
-        bar.pack(fill="x", padx=12, pady=(10, 6))
+        bar.pack(fill="x", padx=12, pady=(10, 2))
         tk.Label(bar, text="🔍", bg=c["bg"], fg=c["text_dim"],
                  font=(FONT, 12)).pack(side="left")
         self.search_var = tk.StringVar()
@@ -425,24 +428,28 @@ class LogsTab(tk.Frame):
                            font=(FONT, 9))
         src.pack(side="left", padx=4)
         src.bind("<<ComboboxSelected>>", lambda _e: self.refresh())
-        _button(bar, "⟳ Refresh", self.refresh, c).pack(side="left", padx=4)
+        _button(bar, "⟳ Refresh", self._reload, c).pack(side="left", padx=4)
         _button(bar, "⇩ Export CSV", self._export, c).pack(side="left", padx=4)
         self.count_label = tk.Label(bar, text="", bg=c["bg"], fg=c["text_dim"],
                                     font=(FONT, 9))
         self.count_label.pack(side="right", padx=8)
+
+        self.db_label = tk.Label(self, text="", bg=c["bg"], fg=c["text_dim"],
+                                 font=(FONT, 9), anchor="w")
+        self.db_label.pack(fill="x", padx=14, pady=(0, 4))
 
         pane = tk.PanedWindow(self, orient="vertical", bg=c["bg"], sashwidth=6,
                               sashrelief="flat", bd=0)
         pane.pack(fill="both", expand=True, padx=12, pady=(0, 12))
 
         top = tk.Frame(pane, bg=c["surface"])
-        cols = ("date", "source", "status", "prompt", "events")
-        self.tree = ttk.Treeview(top, columns=cols, show="headings",
-                                 selectmode="browse")
+        cols = ("id", "date", "source", "model", "time", "tokens", "prompt", "status")
+        self.tree = ttk.Treeview(top, columns=cols, show="headings", selectmode="browse")
         for col, text, width, anchor in (
-                ("date", "Date", 140, "w"), ("source", "Source", 70, "w"),
-                ("status", "Result", 110, "w"), ("prompt", "Input prompt", 420, "w"),
-                ("events", "Events", 60, "center")):
+                ("id", "Event ID", 62, "center"), ("date", "Date / time", 140, "w"),
+                ("source", "Source", 64, "w"), ("model", "Model", 120, "w"),
+                ("time", "Inference", 80, "e"), ("tokens", "Tokens in / out", 105, "center"),
+                ("prompt", "Input", 360, "w"), ("status", "Result", 105, "w")):
             self.tree.heading(col, text=text)
             self.tree.column(col, width=width, anchor=anchor, minwidth=50,
                              stretch=(col == "prompt"))
@@ -464,19 +471,46 @@ class LogsTab(tk.Frame):
         dsb.pack(side="right", fill="y")
         self.detail.pack(fill="both", expand=True)
         self.detail.tag_configure("dim", foreground=c["text_dim"])
-        self.detail.tag_configure("head", foreground=c["accent"],
-                                  font=(FONT, 9, "bold"))
+        self.detail.tag_configure("head", foreground=c["accent"], font=(FONT, 9, "bold"))
         for kind, colour in self.KIND_COLOR.items():
             self.detail.tag_configure(f"k_{kind}", foreground=c[colour],
                                       font=(FONT, 9, "bold"))
         pane.add(bottom, minsize=120)
+        add_text_controls(self.detail, c)
 
     # ── data ──────────────────────────────────────────────────────────────
+    def on_show(self):
+        self.logger.refresh()
+        self.refresh()
+
+    def _reload(self):
+        self.logger.refresh()
+        self._dirty.set()
+
     def _poll(self):
+        self._ticks += 1
         if self._dirty.is_set():
             self._dirty.clear()
             self.refresh()
+        elif self._ticks % 8 == 0:
+            self._update_db_label()
         self.after(400, self._poll)
+
+    def _update_db_label(self):
+        st = self.logger.status()
+        pending = f"  |  {st['pending']} entr{'y' if st['pending'] == 1 else 'ies'} saved " \
+                  f"locally, waiting to sync" if st["pending"] else ""
+        if st["state"] == "connected":
+            self.db_label.configure(text="● PostgreSQL connected  (table: event_logs)" + pending,
+                                    fg=self.c["success"])
+        elif st["state"] == "offline":
+            self.db_label.configure(
+                text="● PostgreSQL unreachable - logging to a local file and retrying"
+                     + pending + (f"  ({st['error'][:70]})" if st["error"] else ""),
+                fg=self.c["warning"])
+        else:
+            self.db_label.configure(text="● Local file logging only (no database configured)"
+                                    + pending, fg=self.c["text_dim"])
 
     def _filtered(self):
         needle = self.search_var.get().strip().casefold()
@@ -486,23 +520,33 @@ class LogsTab(tk.Frame):
             if source != "All" and e["source"] != source:
                 continue
             if needle:
-                hay = (e["prompt"] + " " + " ".join(
-                    ev["kind"] + " " + ev["message"] for ev in e["events"])).casefold()
+                hay = (e["prompt"] + " " + (e.get("output") or "") + " " +
+                       (e.get("model") or "") + " " + " ".join(
+                           ev["kind"] + " " + ev["message"] for ev in e["events"])).casefold()
                 if needle not in hay:
                     continue
             out.append(e)
         return out
 
+    @staticmethod
+    def _tokens(e):
+        if e.get("prompt_tokens") is None and e.get("completion_tokens") is None:
+            return "-"
+        return f"{e.get('prompt_tokens') or 0} / {e.get('completion_tokens') or 0}"
+
     def refresh(self):
+        self._update_db_label()
         selected = self.tree.selection()
         entries = self._filtered()
         self._entries = {e["id"]: e for e in entries}
         self.tree.delete(*self.tree.get_children())
         for e in entries:
             self.tree.insert("", "end", iid=e["id"], tags=(e["status"],), values=(
-                e["timestamp"].replace("T", " "), e["source"], e["status"],
-                e["prompt"].replace("\n", " ")[:200], len(e["events"])))
-        self.count_label.configure(text=f"{len(entries)} entr{'y' if len(entries) == 1 else 'ies'}")
+                e.get("event_id") or "…", e["timestamp"].replace("T", " "), e["source"],
+                e.get("model") or "-", format_ms(e.get("inference_ms")), self._tokens(e),
+                e["prompt"].replace("\n", " ")[:200], e["status"]))
+        n = len(entries)
+        self.count_label.configure(text=f"{n} entr{'y' if n == 1 else 'ies'}")
         if selected and selected[0] in self._entries:
             self.tree.selection_set(selected[0])
             self._show(self._entries[selected[0]])
@@ -515,23 +559,35 @@ class LogsTab(tk.Frame):
         sel = self.tree.selection()
         self._show(self._entries.get(sel[0]) if sel else None)
 
-    def _show(self, entry):
+    def _show(self, e):
         d = self.detail
         d.configure(state="normal")
         d.delete("1.0", "end")
-        if entry:
-            d.insert("end", "Date    ", "dim")
-            d.insert("end", entry["timestamp"].replace("T", " ") + "\n")
-            d.insert("end", "Source  ", "dim")
-            d.insert("end", entry["source"] + "\n")
-            d.insert("end", "Result  ", "dim")
-            d.insert("end", entry["status"] + "\n\n")
-            d.insert("end", "INPUT PROMPT\n", "head")
-            d.insert("end", entry["prompt"] + "\n\n")
-            d.insert("end", "EVENTS\n", "head")
-            if not entry["events"]:
+        if e:
+            def row(label, value):
+                d.insert("end", f"{label:<18}", "dim")
+                d.insert("end", f"{value}\n")
+            row("Event ID", e.get("event_id") or "pending (not yet in the database)")
+            row("Date / time", e["timestamp"].replace("T", " "))
+            row("Source", e["source"])
+            row("Result", e["status"])
+            row("Model", e.get("model") or "- (no model used)")
+            row("Inference time", format_ms(e.get("inference_ms")))
+            row("Prompt tokens", "-" if e.get("prompt_tokens") is None else e["prompt_tokens"])
+            row("Completion tokens",
+                "-" if e.get("completion_tokens") is None else e["completion_tokens"])
+            row("Total tokens", "-" if e.get("total_tokens") is None else e["total_tokens"])
+            d.insert("end", "\nINPUT\n", "head")
+            d.insert("end", e["prompt"] + "\n")
+            d.insert("end", "\nMODEL OUTPUT\n", "head")
+            if e.get("output"):
+                d.insert("end", e["output"] + "\n")
+            else:
+                d.insert("end", "(none)\n", "dim")
+            d.insert("end", "\nEVENTS\n", "head")
+            if not e["events"]:
                 d.insert("end", "(none yet)\n", "dim")
-            for ev in entry["events"]:
+            for ev in e["events"]:
                 stamp = ev["ts"][11:] if len(ev["ts"]) >= 19 else ev["ts"]
                 d.insert("end", f"{stamp}  ", "dim")
                 d.insert("end", f"{ev['kind']:<13}", f"k_{ev['kind']}")
@@ -541,7 +597,7 @@ class LogsTab(tk.Frame):
     def _export(self):
         path = filedialog.asksaveasfilename(
             defaultextension=".csv", filetypes=[("CSV file", "*.csv")],
-            initialfile="stockllama_activity.csv")
+            initialfile="stockllama_event_logs.csv")
         if path:
             self.logger.export_csv(path, list(self._entries.values()))
             messagebox.showinfo("Export", f"Exported {len(self._entries)} entries.")
@@ -550,18 +606,155 @@ class LogsTab(tk.Frame):
 # ══════════════════════════════════════════════════════════════════════════════
 # Speech
 # ══════════════════════════════════════════════════════════════════════════════
+class RecordingPopup(tk.Toplevel):
+    """Pop-up shown while recording and transcribing: pulsing red dot, timer,
+    live input level, model download progress, and a clear error state."""
+
+    def __init__(self, parent, colors, model_label, on_stop, on_cancel, recorder):
+        super().__init__(parent)
+        self.c = colors
+        self.recorder = recorder
+        self._on_stop = on_stop
+        self._on_cancel = on_cancel
+        self._phase = "recording"          # recording | busy | error
+        self._pulse = 0
+        self._level = 0.0
+        self.title("Voice input")
+        self.configure(bg=colors["surface"])
+        self.resizable(False, False)
+        self.transient(parent)
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+        top = tk.Frame(self, bg=colors["surface"])
+        top.pack(fill="x", padx=24, pady=(20, 8))
+        self.dot = tk.Canvas(top, width=44, height=44, bg=colors["surface"],
+                             highlightthickness=0)
+        self._dot_item = self.dot.create_oval(8, 8, 36, 36, fill=colors["error"], outline="")
+        self.dot.pack(side="left")
+        txt = tk.Frame(top, bg=colors["surface"])
+        txt.pack(side="left", padx=12)
+        self.state_label = tk.Label(txt, text="Listening…", bg=colors["surface"],
+                                    fg=colors["text"], font=(FONT, 13, "bold"), anchor="w")
+        self.state_label.pack(anchor="w")
+        self.timer_label = tk.Label(txt, text="00:00", bg=colors["surface"],
+                                    fg=colors["text_dim"], font=(FONT, 10), anchor="w")
+        self.timer_label.pack(anchor="w")
+
+        self.meter = tk.Canvas(self, width=320, height=10, bg=colors["surface2"],
+                               highlightthickness=0)
+        self._meter_bar = self.meter.create_rectangle(0, 0, 0, 10, fill=colors["accent2"],
+                                                      outline="")
+        self.meter.pack(padx=24, pady=(4, 8))
+
+        self.info = tk.Label(self, text=f"Model: {model_label}\nSpeak now, then press Stop.",
+                             bg=colors["surface"], fg=colors["text_dim"], font=(FONT, 9),
+                             wraplength=320, justify="left")
+        self.info.pack(padx=24, anchor="w")
+        self.progress = ttk.Progressbar(self, mode="indeterminate", length=320)
+
+        self.buttons = tk.Frame(self, bg=colors["surface"])
+        self.buttons.pack(fill="x", padx=24, pady=16)
+        self.stop_btn = _button(self.buttons, "■ Stop & transcribe", self._stop, colors, "danger")
+        self.stop_btn.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self.cancel_btn = _button(self.buttons, "Cancel", self._cancel, colors)
+        self.cancel_btn.pack(side="left")
+
+        self.bind("<Escape>", lambda _e: self._cancel())
+        self.bind("<Return>", lambda _e: self._stop())
+        self.bind("<space>", lambda _e: self._stop())
+        self.update_idletasks()
+        try:
+            x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
+            y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 3
+            self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        except tk.TclError:
+            pass
+        self.after(80, self._tick)
+
+    # ── actions ───────────────────────────────────────────────────────────
+    def _stop(self):
+        if self._phase == "recording":
+            self._on_stop()
+
+    def _cancel(self):
+        self._on_cancel()
+
+    # ── states ────────────────────────────────────────────────────────────
+    def _tick(self):
+        if not self.winfo_exists():
+            return
+        if self._phase == "recording":
+            elapsed = self.recorder.elapsed
+            self.timer_label.configure(text=f"{int(elapsed) // 60:02d}:{int(elapsed) % 60:02d}")
+            target = min(1.0, self.recorder.level * 12)
+            self._level = max(target, self._level * 0.8)         # fast attack, slow decay
+            self.meter.coords(self._meter_bar, 0, 0, int(320 * self._level), 10)
+            self._pulse += 1
+            self.dot.itemconfigure(
+                self._dot_item,
+                fill=self.c["error"] if (self._pulse // 5) % 2 == 0 else "#7A2A2A")
+            if elapsed >= stt_engine.MicRecorder.MAX_SECONDS:
+                self._stop()
+        self.after(80, self._tick)
+
+    def note(self, text):
+        self.info.configure(text=text)
+
+    def show_progress(self, done=None, total=None, text=None):
+        if not self.progress.winfo_ismapped():
+            self.progress.pack(padx=24, pady=(8, 0), before=self.buttons)
+        if done is not None and total:
+            self.progress.stop()
+            self.progress.configure(mode="determinate", maximum=total, value=done)
+        elif str(self.progress.cget("mode")) != "indeterminate":
+            self.progress.configure(mode="indeterminate")
+            self.progress.start(12)
+        elif not getattr(self, "_spinning", False):
+            self.progress.start(12)
+        self._spinning = done is None
+        if text:
+            self.note(text)
+
+    def set_busy(self, message):
+        self._phase = "busy"
+        self.state_label.configure(text=message)
+        self.dot.itemconfigure(self._dot_item, fill=self.c["warning"])
+        self.meter.coords(self._meter_bar, 0, 0, 0, 10)
+        self.stop_btn.configure(state="disabled")
+        self.show_progress()
+
+    def show_error(self, message):
+        self._phase = "error"
+        self.progress.stop()
+        self.progress.pack_forget()
+        self.state_label.configure(text="Voice input problem", fg=self.c["error"])
+        self.timer_label.configure(text="")
+        self.dot.itemconfigure(self._dot_item, fill=self.c["error"])
+        self.meter.coords(self._meter_bar, 0, 0, 0, 10)
+        self.info.configure(text=message, fg=self.c["text"])
+        self.stop_btn.pack_forget()
+        self.cancel_btn.configure(text="Close")
+
+
 class SpeechControls(tk.Frame):
+    """Voice settings (model + language) and the record flow behind the 🎙 button.
+
+    Call toggle() from the mic button: a pop-up shows the recording; on Stop the
+    audio is transcribed locally and on_text(text, transcription) is called so the
+    app can place the text in the input box. Missing speech models are downloaded
+    automatically on first use (progress is shown in the pop-up)."""
     LANGUAGES = ["auto", "en", "hi", "kn", "ta", "te", "ml", "mr", "bn"]
 
     def __init__(self, parent, recognizer: stt_engine.SpeechRecognizer, colors,
-                 on_text, on_error=None):
-        """on_text(text, transcription) is called on the Tk thread."""
+                 on_text, on_error=None, recorder=None):
         super().__init__(parent, bg=colors["surface"])
         self.c = colors
         self.recognizer = recognizer
         self.on_text = on_text
         self.on_error = on_error
-        self.recorder = stt_engine.MicRecorder()
+        self.recorder = recorder or stt_engine.MicRecorder()
+        self._popup = None
+        self._busy = False
         self._load_thread = None
         self._load_error = None
         self._models = stt_engine.available_models()
@@ -569,8 +762,8 @@ class SpeechControls(tk.Frame):
 
     def _build(self):
         c = self.c
-        tk.Label(self, text="VOICE INPUT", bg=c["surface"], fg=c["text_dim"],
-                 font=(FONT, 8, "bold")).pack(anchor="w", pady=(0, 4))
+        tk.Label(self, text="VOICE INPUT  (🎙 button next to Parse)", bg=c["surface"],
+                 fg=c["text_dim"], font=(FONT, 8, "bold")).pack(anchor="w", pady=(0, 4))
         row1 = tk.Frame(self, bg=c["surface"])
         row1.pack(fill="x")
         self.model_var = tk.StringVar(value=self._default_label())
@@ -589,12 +782,9 @@ class SpeechControls(tk.Frame):
         self.lang_var = tk.StringVar(value="auto")
         ttk.Combobox(row2, textvariable=self.lang_var, state="readonly", width=5,
                      values=self.LANGUAGES, font=(FONT, 9)).pack(side="left")
-        self.rec_btn = _button(row2, "🎙 RECORD", self._toggle, c, "ghost")
-        self.rec_btn.pack(side="left", fill="x", expand=True, padx=(6, 0))
-        self.status = tk.Label(self, text="", bg=c["surface"], fg=c["text_dim"],
-                               font=(FONT, 8), anchor="w", justify="left",
-                               wraplength=290)
-        self.status.pack(fill="x", pady=(4, 0))
+        self.status = tk.Label(row2, text="", bg=c["surface"], fg=c["text_dim"],
+                               font=(FONT, 8), anchor="w", justify="left", wraplength=230)
+        self.status.pack(side="left", fill="x", expand=True, padx=(8, 0))
 
     # ── model list ────────────────────────────────────────────────────────
     def _default_label(self):
@@ -614,8 +804,7 @@ class SpeechControls(tk.Frame):
             self._status(f"Needs:  {stt_engine.install_hint(m.backend)}", "warning")
         else:
             size = f" (~{m.approx_mb} MB)" if m.approx_mb else ""
-            self._status(f"Selected{size}. Loads on first recording; "
-                         f"hub models download once.", "text_dim")
+            self._status(f"Selected{size}. Downloads once on first use.", "text_dim")
 
     def _add_menu(self):
         menu = tk.Menu(self, tearoff=0)
@@ -647,17 +836,22 @@ class SpeechControls(tk.Frame):
         self.model_var.set(model.label)
         self._on_model_selected()
 
-    # ── recording ─────────────────────────────────────────────────────────
-    def _toggle(self):
-        if self.recorder.recording:
-            self._stop()
-        else:
-            self._start()
+    # ── record flow ───────────────────────────────────────────────────────
+    def toggle(self):
+        """Mic button: open the recording pop-up (or bring it forward)."""
+        if self._busy:
+            if self._popup is not None and self._popup.winfo_exists():
+                self._popup.lift()
+            return
+        self._start()
 
     def _start(self):
         model = self._current_model()
+        self._busy = True
+        self._popup = RecordingPopup(self.winfo_toplevel(), self.c, model.label.strip(),
+                                     self._stop, self._cancel, self.recorder)
         if not stt_engine.backend_installed(model.backend):
-            self._fail(f"{model.label} needs an extra package. Run:  "
+            self._fail(f"'{model.label.strip()}' needs an extra package. Run:\n  "
                        f"{stt_engine.install_hint(model.backend)}")
             return
         try:
@@ -665,30 +859,38 @@ class SpeechControls(tk.Frame):
         except Exception as exc:
             self._fail(str(exc))
             return
-        self.rec_btn.configure(text="■ STOP", bg=self.c["accent3"],
-                               fg="#0D1117", activebackground="#FF8B7A")
-        self._status("Listening… press STOP when done.", "accent3")
-        # load the model while the user is still speaking
+        self._status("Listening…", "accent3")
+        # load / download the speech model while the user is still speaking
         self._load_error = None
+        self._load_thread = None
         if self.recognizer.loaded_key != model.key:
             def work():
                 try:
-                    self.recognizer.load(model)
+                    self.recognizer.load(model, self._download_progress)
                 except Exception as exc:
                     self._load_error = exc
             self._load_thread = threading.Thread(target=work, daemon=True)
             self._load_thread.start()
-        else:
-            self._load_thread = None
+
+    def _download_progress(self, done, total):
+        """Called from the loader thread while a model downloads."""
+        self.after(0, self._show_download, done, total)
+
+    def _show_download(self, done, total):
+        if self._popup is not None and self._popup.winfo_exists():
+            self._popup.show_progress(
+                done, total, f"Downloading the speech model (first use only)…  "
+                             f"{done / 1e6:.0f} / {total / 1e6:.0f} MB")
 
     def _stop(self):
         audio = self.recorder.stop()
-        self.rec_btn.configure(text="🎙 RECORD", bg=self.c["surface2"],
-                               fg=self.c["text"], activebackground=self.c["surface3"])
+        popup = self._popup
         if len(audio) < stt_engine.SAMPLE_RATE * 0.3:
-            self._status("Too short - nothing recorded.", "warning")
+            self._fail("Too short - nothing was recorded. Press the microphone, "
+                       "speak, then press Stop.")
             return
-        self.rec_btn.configure(state="disabled")
+        loading = self._load_thread is not None and self._load_thread.is_alive()
+        popup.set_busy("Preparing the speech model…" if loading else "Transcribing…")
         self._status("Transcribing…", "warning")
         language = self.lang_var.get()
         model = self._current_model()
@@ -700,26 +902,54 @@ class SpeechControls(tk.Frame):
                 if self._load_error:
                     raise self._load_error
                 if self.recognizer.loaded_key != model.key:
-                    self.recognizer.load(model)
+                    self.recognizer.load(model, self._download_progress)
+                self.after(0, self._set_transcribing)
                 result = self.recognizer.transcribe(audio, language)
                 self.after(0, self._done, result)
+            except RuntimeError as exc:             # friendly, already explained
+                self.after(0, self._fail, str(exc))
             except Exception as exc:
-                self.after(0, self._fail, f"Speech error: {exc}")
+                self.after(0, self._fail, f"Speech recognition failed: {exc}")
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _set_transcribing(self):
+        if self._popup is not None and self._popup.winfo_exists():
+            self._popup.set_busy("Transcribing…")
+            self._popup.note("Running the speech model on your device…")
+
+    def _cancel(self):
+        if self.recorder.recording:
+            self.recorder.stop()
+        self._close_popup()
+        self._status("Cancelled.", "text_dim")
+
+    def _close_popup(self):
+        if self._popup is not None and self._popup.winfo_exists():
+            self._popup.destroy()
+        self._popup = None
+        self._busy = False
+
     def _done(self, result):
-        self.rec_btn.configure(state="normal")
-        if not result.text:
-            self._status("No speech detected.", "warning")
+        if self._popup is None or not self._popup.winfo_exists():
+            self._busy = False          # user cancelled while it was transcribing
             return
+        if not result.text:
+            self._fail("No speech detected. Try again, a little closer to the microphone.")
+            return
+        self._close_popup()
         self._status(f"Done in {result.elapsed_seconds:.1f}s "
                      f"({result.audio_seconds:.1f}s audio).", "success")
         self.on_text(result.text, result)
 
     def _fail(self, message):
-        self.rec_btn.configure(state="normal")
-        self._status(message, "error")
+        if self.recorder.recording:
+            self.recorder.stop()
+        if self._popup is not None and self._popup.winfo_exists():
+            self._popup.show_error(message)
+        else:
+            self._busy = False
+        self._status(message.splitlines()[0][:90], "error")
         if self.on_error:
             self.on_error(message)
 

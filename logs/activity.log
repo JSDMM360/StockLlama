@@ -102,3 +102,7 @@
 2026-10-23 10:18:31,573 | [8ad22c58]   llm_response: {"item_name": "active dry yeast", "quantity": 250, "unit": "grams", "category": "Food", "date_used": null, "date_bought": null, "notes": null}
 2026-10-23 10:18:31,573 | [8ad22c58]   parsed: 1 item(s) detected: / 250.0 grams active dry yeast [Food]
 2026-10-23 10:18:48,588 | [8ad22c58]   saved: Saved 1 item(s) to the database (ids: 224)
+2026-11-14 19:22:50,656 | [1742a89d6ec4] INPUT (voice): [voice recording]
+2026-11-14 19:22:50,657 | [1742a89d6ec4]   error: Could not open the microphone: Error opening InputStream: Unanticipated host error [PaErrorCode -9999]: 'No such file or directory' [ALSA error -2]
+2026-11-14 19:23:10,160 | [a760f0c98846] INPUT (voice): [voice recording]
+2026-11-14 19:23:10,160 | [a760f0c98846]   error: Could not open the microphone: Error opening InputStream: Unanticipated host error [PaErrorCode -9999]: 'No such file or directory' [ALSA error -2]

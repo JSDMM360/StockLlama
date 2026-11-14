@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Iterable, Optional
 
 from matplotlib.figure import Figure
@@ -27,6 +27,9 @@ CHART_TYPES: "OrderedDict[str, str]" = OrderedDict([
     ("Area  - stock over time", "area"),
     ("Bar   - stock / daily change", "bar"),
     ("Pie   - share of stock", "pie"),
+    ("Scatter - movements over time", "scatter"),
+    ("Combo - stock + usage/purchases", "combo"),
+    ("Flow  - replenished vs used", "flow"),
 ])
 
 THEME = {
@@ -72,6 +75,15 @@ class Ingredient:
             total += per_day[day]
             out.append((day, total))
         return out
+
+    def daily_flows(self):
+        """[(date, bought, used)] per day, both as positive numbers."""
+        buy: dict = defaultdict(float)
+        use: dict = defaultdict(float)
+        for day, delta in self.movements:
+            (buy if delta > 0 else use)[day] += abs(delta)
+        return [(d, buy.get(d, 0.0), use.get(d, 0.0))
+                for d in sorted(set(buy) | set(use))]
 
     def daily_change(self):
         per_day: dict = defaultdict(float)
@@ -169,6 +181,18 @@ def _figure(ings: list, chart_type: str, title: str) -> Figure:
             _bar_net_stock(ax, ings)
         else:
             _bar_daily_change(ax, ings[0])
+    elif chart_type == "scatter":
+        _scatter_movements(ax, ings)
+    elif chart_type == "combo":
+        if len(ings) > 1:
+            _combo_multi(ax, ings)
+        else:
+            _combo_single(fig, ax, ings[0])
+    elif chart_type == "flow":
+        if len(ings) > 1:
+            _flow_by_ingredient(ax, ings)
+        else:
+            _flow_weekly(ax, ings[0])
     else:
         raise ValueError(f"Unknown chart type: {chart_type}")
     return fig
@@ -270,3 +294,150 @@ def _pie(ings, title) -> Figure:
         ax.set_xlabel("Quantities are in mixed units", color=THEME["dim"],
                       fontsize=8)
     return fig
+
+
+# ── scatter / combo / flow ────────────────────────────────────────────────────
+def _date_axis(ax):
+    loc = mdates.AutoDateLocator()
+    ax.xaxis.set_major_locator(loc)
+    ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(loc))
+
+
+def _scatter_movements(ax, ings):
+    """Every purchase (▲) and usage (▼) as a point; marker size = quantity."""
+    palette = THEME["palette"]
+    biggest = max((max(b, u) for i in ings for _, b, u in i.daily_flows()), default=1) or 1
+    size = lambda q: 30 + 170 * q / biggest
+    for idx, ing in enumerate(ings):
+        flows = ing.daily_flows()
+        multi = len(ings) > 1
+        buy_c = palette[idx % len(palette)] if multi else THEME["good"]
+        use_c = palette[idx % len(palette)] if multi else THEME["bad"]
+        bx = [d for d, b, _ in flows if b > 0]
+        by = [b for _, b, _ in flows if b > 0]
+        ux = [d for d, _, u in flows if u > 0]
+        uy = [-u for _, _, u in flows if u > 0]
+        if bx:
+            ax.scatter(bx, by, s=[size(q) for q in by], marker="^", color=buy_c,
+                       alpha=0.85, edgecolors=THEME["bg"], linewidths=0.6,
+                       label=ing.label if multi else "Replenished  ▲")
+        if ux:
+            ax.scatter(ux, uy, s=[size(-q) for q in uy], marker="v", color=use_c,
+                       alpha=0.85, edgecolors=THEME["bg"], linewidths=0.6,
+                       label=None if multi else "Used  ▼")
+    ax.axhline(0, color=THEME["grid"], linewidth=1)
+    ax.set_ylabel("Quantity moved  (▲ bought / ▼ used)"
+                  + (" - mixed units" if _mixed_units(ings) else
+                     f" ({ings[0].unit})" if ings[0].unit else ""),
+                  color=THEME["dim"], fontsize=9)
+    ax.margins(x=0.08, y=0.2)
+    _date_axis(ax)
+    _legend(ax)
+
+
+def _combo_single(fig, ax, ing):
+    """Stock level (line, left axis) with purchases / usage bars (right axis)."""
+    pts = ing.timeline()
+    flows = ing.daily_flows()
+    last_day = max([d for d, _ in pts] + [d for d, _, _ in flows])
+    xs = [d for d, _ in pts]
+    ys = [v for _, v in pts]
+    if xs and xs[-1] < last_day:
+        xs.append(last_day)
+        ys.append(ys[-1])
+    ax2 = ax.twinx()
+    ax2.bar([d for d, _, _ in flows], [b for _, b, _ in flows], color=THEME["good"],
+            alpha=0.45, width=0.6, label="Bought")
+    ax2.bar([d for d, _, _ in flows], [-u for _, _, u in flows], color=THEME["bad"],
+            alpha=0.45, width=0.6, label="Used")
+    ax2.set_ylabel(f"Bought / used per day{f' ({ing.unit})' if ing.unit else ''}",
+                   color=THEME["dim"], fontsize=9)
+    ax2.tick_params(colors=THEME["dim"], labelsize=8)
+    for spine in ax2.spines.values():
+        spine.set_color(THEME["grid"])
+    ax2.grid(False)
+    ax.set_zorder(ax2.get_zorder() + 1)       # line above the bars
+    ax.patch.set_visible(False)
+    ax.step(xs, ys, where="post", color=THEME["palette"][0], linewidth=2, label="Stock")
+    ax.plot(xs[:len(pts)], ys[:len(pts)], "o", color=THEME["palette"][0], markersize=4)
+    ax.axhline(0, color=THEME["grid"], linewidth=1)
+    ax.set_ylabel(f"Stock{f' ({ing.unit})' if ing.unit else ''}", color=THEME["dim"],
+                  fontsize=9)
+    lo = min(ax.get_ylim()[0], ax2.get_ylim()[0])      # same scale: zero lines line up
+    hi = max(ax.get_ylim()[1], ax2.get_ylim()[1])
+    ax.set_ylim(lo, hi)
+    ax2.set_ylim(lo, hi)
+    _date_axis(ax)
+    handles = ax.get_legend_handles_labels()[0] + ax2.get_legend_handles_labels()[0]
+    labels = ax.get_legend_handles_labels()[1] + ax2.get_legend_handles_labels()[1]
+    leg = ax.legend(handles, labels, facecolor=THEME["surface"], edgecolor=THEME["grid"],
+                    fontsize=8, labelcolor=THEME["text"], loc="best")
+    if leg:
+        leg.get_frame().set_alpha(0.9)
+
+
+def _combo_multi(ax, ings):
+    """Stock lines for each ingredient, with ▲ / ▼ at every purchase / usage day."""
+    _stock_over_time(ax, ings, fill=False)
+    palette = THEME["palette"]
+    for idx, ing in enumerate(ings):
+        level = dict(ing.timeline())
+        color = palette[idx % len(palette)]
+        for day, bought, used in ing.daily_flows():
+            ax.plot([day], [level[day]], marker="^" if bought >= used else "v",
+                    color=color, markersize=9, markeredgecolor=THEME["bg"], zorder=5)
+    ax.plot([], [], "^", color=THEME["dim"], label="▲ purchase day")
+    ax.plot([], [], "v", color=THEME["dim"], label="▼ usage day")
+    _legend(ax)
+
+
+def _flow_by_ingredient(ax, ings):
+    """Total replenished vs total used for each ingredient."""
+    n = len(ings)
+    xs = list(range(n))
+    width = 0.38
+    b = ax.bar([x - width / 2 for x in xs], [i.bought for i in ings], width,
+               color=THEME["good"], label="Replenished")
+    u = ax.bar([x + width / 2 for x in xs], [i.used for i in ings], width,
+               color=THEME["bad"], label="Used")
+    ax.bar_label(b, fmt="%.1f", color=THEME["text"], fontsize=7, padding=2)
+    ax.bar_label(u, fmt="%.1f", color=THEME["text"], fontsize=7, padding=2)
+    ax.set_xticks(xs)
+    ax.set_xticklabels([i.label for i in ings], rotation=30 if n > 4 else 0,
+                       ha="right" if n > 4 else "center", color=THEME["dim"], fontsize=8)
+    ax.set_ylabel("Quantity" + (" (mixed units)" if _mixed_units(ings) else ""),
+                  color=THEME["dim"], fontsize=9)
+    ax.margins(y=0.15)
+    _legend(ax)
+
+
+def _flow_weekly(ax, ing):
+    """Replenished vs used for each week."""
+    flows = ing.daily_flows()
+    week = lambda d: d - timedelta(days=d.weekday())
+    bought: dict = defaultdict(float)
+    used: dict = defaultdict(float)
+    for d, b, u in flows:
+        bought[week(d)] += b
+        used[week(d)] += u
+    first, last = min(bought.keys() | used.keys()), max(bought.keys() | used.keys())
+    weeks, w = [], first
+    while w <= last:
+        weeks.append(w)
+        w += timedelta(days=7)
+    xs = list(range(len(weeks)))
+    width = 0.38
+    ax.bar([x - width / 2 for x in xs], [bought.get(w, 0) for w in weeks], width,
+           color=THEME["good"], label="Replenished")
+    ax.bar([x + width / 2 for x in xs], [used.get(w, 0) for w in weeks], width,
+           color=THEME["bad"], label="Used")
+    ax.set_xticks(xs)
+    ax.set_xticklabels([w.strftime("%d %b") for w in weeks],
+                       rotation=30 if len(weeks) > 6 else 0,
+                       ha="right" if len(weeks) > 6 else "center",
+                       color=THEME["dim"], fontsize=8)
+    ax.set_xlabel("Week starting", color=THEME["dim"], fontsize=9)
+    ax.set_ylabel(f"Quantity{f' ({ing.unit})' if ing.unit else ''}", color=THEME["dim"],
+                  fontsize=9)
+    ax.margins(y=0.15)
+    _legend(ax)

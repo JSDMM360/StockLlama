@@ -16,6 +16,7 @@ and how the pieces work together.
    - [`database.py`](#databasepy) – PostgreSQL access
    - [`inventory_logic.py`](#inventory_logicpy) – matching, units, actions (pure logic)
    - [`ollama_parser.py`](#ollama_parserpy) – sentence → items
+   - [`default_names.py`](#default_namespy) – starter name dictionary
    - [`config.py`](#configpy) – settings
    - [`setup_db.py`](#setup_dbpy)
    - [`test_inventory_logic.py`](#test_inventory_logicpy)
@@ -86,7 +87,8 @@ everywhere so the dark theme stays consistent.
 | `HoldToConfirmDialog(...)` | Modal confirmation that cannot be passed by accident. The user must press **and hold** a canvas bar for `hold_seconds`. `_press` records `time.monotonic()` and starts `_tick`, which runs every 30 ms, redraws the progress (`_draw`) and, when the fraction reaches 1, closes the dialog and calls `on_confirm`. `_release` (button release **or** pointer leaving the bar) cancels and resets. Esc / Cancel closes it. Used by *Erase all*. |
 | `SettingsDialog(parent, on_save, on_forget)` | Two-column form: PostgreSQL (host, port, database, username, password with *Show password*) and Ollama URL on the left, *Item matching* (mode drop-down, two percentage thresholds, *Forget remembered choices*) on the right. `_read` validates (port 1–65535, required fields, `0 ≤ similar ≤ confident ≤ 100`) and returns `(db_cfg, ollama_cfg, match_cfg)`. `_test` checks PostgreSQL (`psycopg2.connect(connect_timeout=5)`) and Ollama (`GET /api/tags`) in a background thread and shows the result without saving. `_save` hands the values to `on_save`. `_toggle_pw` shows/hides the password. |
 | `MatchPromptDialog(parent, item, decision, position)` | The "similar item found" question. Lists each candidate of the `MatchDecision` as a radio button with stock and similarity %, plus *keep separate* (for add/set) or *none of these* (for remove). *Remember my choice* is a checkbox. `_confirm` builds the answer dict (`{"action": "merge", "row_id", "remember"}`, `{"action": "new", "remember"}` or `{"action": "skip"}`) into `self.result`; closing the window or Esc (`_skip`) means skip. |
-| `MergeSimilarDialog(parent, groups, auto_threshold, on_merge)` | Shows the groups from `find_similar_groups` in a scrollable list. For each group: a "Merge this group" checkbox (pre-ticked when the group's lowest similarity ≥ the confident threshold), a radio button per item to choose the one to keep, a live preview (`preview`) of the resulting total in the kept item's unit, and a warning for items whose unit cannot be converted (`_add_group` builds the widgets of one group). `_merge` collects `(keep_id, [other_ids])` jobs and calls `on_merge`. |
+| `NamesDialog(parent, db, prefill, on_close)` | The names dictionary editor. Left: the groups (`● ` marks groups that have items in stock), right: the names of the selected group with *Add name*, *Remove name*, *Delete group*, and a box listing the inventory items stored under these names. Bottom: *New group* (comma-separated names, pre-filled with the selected item's name), *Load starter names*. All edits go straight to the database (`add_name_group`, `add_name_to_group`, `remove_name`, `delete_name_group`, `load_starter_names`); `on_close(changed)` tells the app whether anything changed. |
+| `MergeSimilarDialog(parent, groups, auto_threshold, on_merge)` | Reviews the groups from `find_similar_groups`. A group is only a *suggestion* (all sauces, all beans), so **every item gets its own drop-down**: `KEEP` ("Keep as a separate item") or "Merge into “X”" for another item of the group. `_add_group` builds one group: `suggest()` presets *merge into the generic item* only for confident matches (score ≥ `auto_threshold`, convertible unit) and *keep* for everything else; `refresh()` keeps the choices valid (an item that others merge into can only be kept; an item can only merge into an item that is being kept and whose unit it converts to; it repeats until nothing changes) and rewrites the *Result* preview (`name: total unit  absorbs: …`). Buttons *Suggestion* and *Keep all separate*; a per-group *Apply this group* checkbox (pre-ticked when merges are suggested). `_merge` builds `jobs = [(kept_id, [merged_ids])]` – several per group are possible – and `separate_pairs` (every pair of kept items in an applied group) and calls `on_merge(jobs, separate_pairs)`. |
 
 ### `InventoryApp`
 
@@ -100,7 +102,7 @@ everywhere so the dark theme stays consistent.
 | `_build_input_panel` | Left panel: natural-language text box (with placeholder), **PARSE WITH AI**, the AI response box, the confirm area, then the manual form. |
 | `_build_manual_form` | Fields: item name, quantity, unit, category (combobox), date bought, date used, notes; buttons **＋ ADD ITEM** and **✎ UPDATE**. Field variables live in `self.form_vars`. |
 | `_build_stats_bar` | Four cards keyed `total_items`, `unique_items`, `total_categories`, `today_entries`. |
-| `_build_table_panel` | Search box, category filter, **⟳ Refresh**, **⧉ Merge similar**, **☢ Erase all**, **🗑 Delete**, and the `ttk.Treeview` with nine columns (ID, Item Name, Qty, Unit, Category, Date Bought, Date Used, Notes, Last Updated). Each heading is wired to `_sort_by`. Row colours: `low` (orange) for low stock, `even`/`odd` otherwise. |
+| `_build_table_panel` | Search box, category filter, **⟳ Refresh**, **⧉ Merge similar**, **📖 Names**, **☢ Erase all**, **🗑 Delete**, and the `ttk.Treeview` with nine columns (ID, Item Name, Qty, Unit, Category, Date Bought, Date Used, Notes, Last Updated). Each heading is wired to `_sort_by`. Row colours: `low` (orange) for low stock, `even`/`odd` otherwise. |
 
 **Parsing and saving**
 
@@ -137,7 +139,8 @@ everywhere so the dark theme stays consistent.
 | `_open_settings` | Opens `SettingsDialog`. |
 | `_apply_settings(db, ollama, match)` | `config.save_settings(...)` writes `settings.json` and updates the live config dicts; then closes the old connection, calls `parser.reload_config()`, clears the table and runs `_connect_services` again. If the file cannot be written the new values still apply for the session. |
 | `_forget_matches` | Calls `db.forget_remembered_matches()`. |
-| `_open_merge_similar` / `_do_merge` | Gets groups from the database, opens `MergeSimilarDialog`, and for each chosen group calls `db.merge_items`; reports how many were merged and how many were skipped because of units. |
+| `_open_names` / `_after_names(changed)` | Opens `NamesDialog` (starting at the selected row's name). After a change it refreshes the table and, if items now share a name (a confident group in `find_similar_groups`), offers to open the merge dialog. |
+| `_open_merge_similar` / `_do_merge(jobs, separate_pairs)` | Gets groups from the database and opens `MergeSimilarDialog`. `_do_merge` first records the kept-separate pairs (`db.mark_items_distinct`), then calls `db.merge_items` for every job; reports how many items were merged, how many pairs were kept separate and how many were skipped because of units. |
 
 **Refreshing and services**
 
@@ -195,11 +198,28 @@ statements must succeed or fail together.
 Result `status` values: `created`, `increased`, `decreased`, `set`, `clamped`, `not_found`,
 `unit_mismatch`, `invalid`, `ambiguous`, `skipped`.
 
+### Name dictionary
+
+| Method | What it does |
+|--------|--------------|
+| `_synonym_map(cur)` / `synonym_map()` | Reads `name_group_names` into `{tuple(name tokens): group_id}`, the form `inventory_logic` uses. `resolve_match` and `find_similar_groups` load it on every call, so dictionary edits apply immediately. |
+| `get_name_groups()` | Every group as `{id, label, names, items}`, where `items` are the inventory rows stored under one of its names (used by the dialog's "In your inventory" box). |
+| `find_name_group(name)` | The group containing a name, or `None`. |
+| `add_name_group(names, label)` | Declares that the names mean one item (at least two different names). Names already in the dictionary pull their group in, and overlapping groups are folded into one. |
+| `add_name_to_group(group_id, name)` | Adds one name; refuses a name that already belongs to a group. |
+| `remove_name(name_key)` | Removes a name; a group left with fewer than two names is deleted. |
+| `delete_name_group(id)` | Deletes a group (inventory rows are untouched). |
+| `load_starter_names()` | Adds the groups from `default_names.py`; returns how many were added. |
+
+The two tables (`name_groups`, `name_group_names`) have no link to `inventory`: the dictionary is
+knowledge, so it survives *Erase all*, and it works before or after the items exist.
+
 ### Merging existing rows
 
 | Method | What it does |
 |--------|--------------|
-| `find_similar_groups()` | Loads all rows and returns `inventory_logic.find_similar_groups(rows, ask_threshold)`. |
+| `find_similar_groups()` | Loads all rows and the remembered *keep separate* pairs and returns `inventory_logic.find_similar_groups(rows, ask_threshold, distinct)`, so pairs you already kept separate are not suggested again. |
+| `mark_items_distinct(pairs)` | Records pairs of existing items (`(id_a, id_b)`) as different products: stores each item's partner name in `item_distinct` in both directions. Effect: the merge tool stops grouping them and `decide_match` never offers one as a match for the other. Returns the number of pairs stored. |
 | `merge_items(canonical_id, member_ids)` | In one transaction, locks the rows; for every member whose unit converts into the kept row's unit: adds the converted quantity, takes the latest `date_bought`/`date_used`, re-points the member's `inventory_log` rows to the kept row, writes a `merged` log entry, deletes the member and stores its name as an alias. Members with an incompatible unit are skipped and reported. Returns `{merged, skipped, quantity, unit}`. |
 
 ---
@@ -221,35 +241,41 @@ are made, which is why it can be unit tested in milliseconds.
 
 | Function | What it does |
 |----------|--------------|
-| `_singular(word)` | Cheap English singularising (`berries → berry`, `tomatoes → tomato`, `rice` and `hummus` unchanged). |
+| `_singular(word)` | Cheap English singularising (`berries → berry`, `tomatoes → tomato`, irregular `leaves → leaf`, `rice` and `hummus` unchanged). |
 | `name_tokens(name)` | Lower-cases, strips punctuation and leading filler words (`some`, `the`, `a`, `of`, `my`), singularises each word. `"Active Dry Yeasts"` → `['active','dry','yeast']`. |
+| `synonym_tokens(name, synonyms)` | Like `name_tokens`, but every word or phrase in the user's name dictionary (`synonyms = {tuple(tokens): group_id}`) is replaced by one token for its group (`§12`), longest phrase first. `"pudina leaves"` and `"mint leaves"` both become `['§12','leaf']`. |
+| `canonical_key(name, synonyms)` | `name_key` computed from `synonym_tokens`: two names have the same canonical key when they are the same word-for-word or dictionary names of one item. |
 | `name_key(name)` | The tokens joined by spaces: the comparison key for "same name". |
 
 ### Similarity and matching
 
 | Function / class | What it does |
 |------------------|--------------|
-| `_fuzzy_equal(a, b)` | Two words are equal, or (when both have ≥ 4 letters) have a `difflib` ratio ≥ 0.84 – tolerates typos such as `yest`/`yeast`. |
-| `similarity(a, b, cat_a, cat_b)` | Score from 0 to 1. See the algorithm below. |
+| `_fuzzy_equal(a, b)` | Two words are equal, or (when both have ≥ 4 letters) have a `difflib` ratio ≥ 0.84 – tolerates typos such as `yest`/`yeast`. Dictionary tokens (`§…`) only match exactly. |
+| `similarity(a, b, cat_a, cat_b, synonyms)` | Score from 0 to 1. See the algorithm below. |
 | `_rank(row, unit)` | Sort key used to choose between equally named rows: convertible unit first, then most recently updated, then lowest id. |
 | `Candidate` | An existing row plus its score. |
 | `MatchDecision` | The outcome: `kind` (`exact`, `auto`, `ask`, `new`), `row`, `score`, `candidates`, `via` (`alias` / `similarity`). |
-| `decide_match(rows, name, unit, category, aliases, distinct, mode, auto, ask)` | Turns scores into a decision. See below. |
-| `find_similar_groups(rows, threshold)` | Groups existing rows for the merge tool. Rows are processed from the most generic name (fewest words) to the least; each joins the first group whose *first* item it is similar to, otherwise it starts a new group. Comparing only with the group's representative stops unrelated items from being chained together. Each member carries `mergeable` (unit convertible to the representative's). |
+| `decide_match(rows, name, unit, category, aliases, distinct, mode, auto, ask, synonyms)` | Turns scores into a decision. See below. |
+| `find_similar_groups(rows, threshold, distinct, synonyms)` | Groups existing rows for the merge tool. A group means "similar names", **not** "same item" – the dialog lets the user decide per item. Rows are processed from the most generic name (fewest words) to the least; each joins the best-scoring group whose *first* item it is similar to, otherwise it starts a new group. Comparing only with the group's representative stops unrelated items from being chained together. Pairs in `distinct` (`{(row_id, name_key)}`, the user's *keep separate* answers) are never grouped; rows under different names of one dictionary group are grouped with score 1.0. Each member carries its `score` and `mergeable` (unit convertible to the representative's). |
 
-**`similarity` algorithm**
+**`similarity` algorithm** (stricter rule: only *the same name* is ever confident)
 
-1. Tokenise both names. Identical token lists → 1.0.
+1. Tokenise both names with `synonym_tokens` (so dictionary names become the same token). Identical token lists → **1.0**.
 2. Give each word a weight: **3 for the last word (the head noun)**, 1 for the others.
-3. Greedily pair up words that are `_fuzzy_equal`. `score = matched weight ÷ (total weight of both − matched)` (a weighted Jaccard).
-4. If the head nouns match: the score is at least **0.58**; and if every word of the shorter name appears in the longer one, the score is at least **0.90** (minus 0.02 for each extra word beyond the first, so `yeast` vs `active dry yeast` is 0.88).
-5. If the head nouns differ: the score is capped at **0.40** – `rice flour` is not `rice`.
-6. If both categories are known: +0.04 when equal, −0.12 when different.
+3. Greedily pair up words that are `_fuzzy_equal`. If *every* word of both names is paired (same words, spelling variants or plurals only) → **1.0**.
+4. Otherwise `score = matched weight ÷ (total weight of both − matched)` (a weighted Jaccard).
+5. If the head nouns match: the score is at least **0.58**; and if every word of the shorter name appears in the longer one, at least **0.80** (minus 0.02 per extra word beyond the first). *Contained* names are related, not identical.
+6. If the head nouns differ: the score is capped at **0.40** – `rice flour` is not `rice`.
+7. If both categories are known: +0.04 when equal, −0.12 when different.
+8. Anything that is not identical is capped at **0.84**, so it can never reach the default 0.85 "confident" threshold.
 
 | Pair | Score |
 |------|-------|
-| yeast ~ active dry yeast | 0.88 |
-| rice ~ basmati rice | 0.90 |
+| yest ~ yeast, Tomatoes ~ tomato | 1.00 |
+| pudina ~ mint (with the dictionary) | 1.00 |
+| rice ~ basmati rice, beans ~ kidney beans | 0.80 |
+| yeast ~ active dry yeast | 0.78 |
 | active dry yeast ~ instant dry yeast | 0.67 |
 | basmati rice ~ red rice | 0.60 |
 | rice flour ~ rice | 0.40 |
@@ -258,11 +284,11 @@ are made, which is why it can be unit tested in milliseconds.
 **`decide_match` rules, in order**
 
 1. A remembered **alias** for this name → `exact`.
-2. A row with the same `name_key` → `exact` (if several, prefer one with a convertible unit, then the most recently updated).
+2. A row with the same `canonical_key` (the same name, or another name of the same dictionary group) → `exact` with `via = "name"` or `"dictionary"` (if several rows, prefer one with a convertible unit, then the most recently updated).
 3. Mode `legacy` → `new`.
 4. Otherwise score every row (skipping "keep separate" pairs and rows whose unit cannot be converted). Keep those ≥ the *similar* threshold, best first. None → `new`.
 5. Mode `prompt_all` → `ask`.
-6. Mode `prompt_low`: if the best score ≥ the *confident* threshold and the runner-up is below it (or at least 0.06 lower) → `auto` (use that row silently); otherwise → `ask`.
+6. Mode `prompt_low`: if the best score ≥ the *confident* threshold and the runner-up is below it (or at least 0.06 lower) → `auto` (use that row silently); otherwise → `ask`. With the default thresholds only spelling variants reach `auto`; a name that merely *contains* another (`kidney beans` / `beans`) always asks.
 
 ### Actions
 
@@ -320,17 +346,19 @@ Hand Sanitizer). The app creates the two alias tables itself on first start.
 
 ## `test_inventory_logic.py`
 
-`python -m unittest test_inventory_logic -v` – 40 tests.
+`python -m unittest test_inventory_logic -v` – 62 tests.
 
 | Test class | Needs a DB? | Covers |
 |------------|-------------|--------|
 | `UnitTests` | no | unit names, conversions, number formatting |
 | `ActionTests` | no | the reported sentence, verbs beating a wrong model answer, multi-item sentences, set/fallbacks |
-| `SimilarityTests` | no | variants score high, same-head/different-modifier scores in the "ask" band, different products stay apart, category nudging |
-| `DecisionTests` | no | exact vs auto vs ask vs new in each mode, ambiguity, remembered choices, incompatible units |
-| `GroupTests` | no | grouping for the merge tool, unit-incompatible members |
+| `SimilarityTests` | no | identical names and spelling variants score ≥ 0.85, names containing one another stay below it (stricter rule), same-head/different-modifier scores in the "ask" band, different products stay apart, category nudging |
+| `DictionaryLogicTests` | no | dictionary tokens, 100 % similarity for dictionary names (also inside longer names and for phrases), silent match in every mode, merge-tool grouping, well-formed starter list |
+| `DecisionTests` | no | exact vs auto vs ask vs new in each mode (a name that merely contains another always asks; a spelling variant merges silently), ambiguity, remembered choices, incompatible units |
+| `GroupTests` | no | grouping for the merge tool, items that only share a word (beans, sauces) staying below the confident threshold, remembered *keep separate* pairs, unit-incompatible members |
 | `StockChangeTests` | yes | removal converts units and updates one row, add merges, clamping, unknown item, unit mismatch, set, precision of small amounts |
-| `FuzzyDatabaseTests` | yes | variant updates the generic row, removal through a variant, ask → merge + remember, keep separate + remember, skip, behaviour without a chooser, the three modes, merging existing rows (history and aliases kept), forgetting choices |
+| `NameDictionaryDatabaseTests` | yes | group creation rules, either name updating the same item (both directions), dictionary defined before any item exists, names inside longer names, overlapping groups folding together, adding/removing names, merge tool and `get_name_groups`, dictionary independent of inventory rows |
+| `FuzzyDatabaseTests` | yes | variant updates the generic row, removal through a variant, ask → merge + remember, keep separate + remember, skip, behaviour without a chooser, the three modes, merging existing rows (history and aliases kept), the merge tool honouring remembered *keep separate* pairs, forgetting choices |
 
 Database tests use the configured database but only touch rows named `ZZ test …` / `ZZ fz …`, clean up
 after themselves and are skipped if PostgreSQL cannot be reached.
@@ -378,6 +406,16 @@ Tkinter front end for the Pantry Tracker; imports `pantry_tracker as pt` and reu
 | `_refresh_table` | Shows `list_inventory()` in the table. |
 | `log`, `_set_status`, `_set_busy` | Coloured log lines, status bar, disable input while working. |
 | `_open_settings`, `_reset_db`, `run` | Open settings, confirm and reset the table, start the main loop. |
+
+---
+
+## `default_names.py`
+
+One constant, `STARTER_NAME_GROUPS`: about 40 lists of names that mean the same ingredient (English
+names and common Indian/regional names, for example `["mint", "pudina"]`, `["coriander", "cilantro",
+"dhania"]`, `["yogurt", "curd", "dahi"]`). It is only used by *Load starter names* in the Names dialog
+(`DatabaseManager.load_starter_names`); nothing is loaded automatically and every group can be edited
+afterwards. A test checks that no name appears in two different groups.
 
 ---
 

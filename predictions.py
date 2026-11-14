@@ -19,12 +19,18 @@ Method (deliberately simple and explainable - no training step):
                     window, smoothed so it never claims 0% or 100%
   - run-out range = stock divided by the fast (75th percentile) and slow (25th
                     percentile) per-interval consumption rates
+  - safety stock  = 1.28 x spread of the per-interval consumption x sqrt(lead time)
+                    (about a 90% chance of not running out while waiting for a delivery)
+  - reorder point = consumption x lead time + safety stock
+  - order quantity= enough to reach (lead time + cover days) of consumption + safety stock
+  - trend         = recent consumption vs older consumption (rising / steady / falling)
   - confidence    = from how many usage records exist and how regular the gaps are
 
 It needs at least MIN_USES usage days per ingredient; fewer -> "Not enough data".
 """
 from __future__ import annotations
 
+import math
 import statistics
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -39,6 +45,7 @@ from charts import THEME, Ingredient, _new_axes
 RECENT = 10          # usage days considered per ingredient
 MIN_USES = 3         # usage days needed before predicting
 MAX_DAYS = 3650      # beyond this we say "no run-out in sight"
+SERVICE_Z = 1.28     # ~90% service level for the safety stock
 WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
             "Saturday", "Sunday"]
 
@@ -65,6 +72,12 @@ class Forecast:
     days_left_early: Optional[int] = None
     days_left_late: Optional[int] = None
     weekday: Optional[str] = None             # habitual weekday, if clear
+    trend: Optional[str] = None               # rising | steady | falling
+    lead: int = 5
+    cover: int = 14
+    safety_stock: Optional[float] = None
+    reorder_point: Optional[float] = None
+    order_qty: Optional[float] = None         # suggested quantity to order now
     advice: str = "Not enough data"
 
 
@@ -85,11 +98,12 @@ def _quartiles(values: list):
 
 
 def forecast(ing: Ingredient, today: Optional[date] = None, horizon: int = 7,
-             lead: int = 5) -> Forecast:
+             lead: int = 5, cover: int = 14) -> Forecast:
     today = today or date.today()
     all_uses = usage_events(ing)
     f = Forecast(ingredient=ing, stock=ing.net, n_uses=len(all_uses),
-                 last_used=all_uses[-1][0] if all_uses else None, horizon=horizon)
+                 last_used=all_uses[-1][0] if all_uses else None, horizon=horizon,
+                 lead=lead, cover=cover)
     uses = all_uses[-RECENT:]
 
     if len(uses) < MIN_USES:
@@ -104,6 +118,29 @@ def forecast(ing: Ingredient, today: Optional[date] = None, horizon: int = 7,
     p25, _p50, p75 = _quartiles(rates)
     f.rate_fast = max(p75, f.rate)
     f.rate_slow = min(p25, f.rate)
+
+    # ── replenishment: safety stock, reorder point, order quantity, trend ───
+    if len(rates) >= 3:
+        f.safety_stock = SERVICE_Z * statistics.pstdev(rates) * math.sqrt(lead)
+    else:
+        f.safety_stock = 0.25 * f.rate * lead
+    f.reorder_point = f.rate * lead + f.safety_stock
+    if f.stock <= f.reorder_point:
+        target = f.rate * (lead + cover) + f.safety_stock
+        qty = max(0.0, target - max(f.stock, 0.0))
+        whole = all(float(q).is_integer() for _, q in uses)   # countable items
+        f.order_qty = float(math.ceil(qty)) if whole else round(qty, 2)
+    else:
+        f.order_qty = 0.0
+    if len(rates) >= 4:
+        half = len(rates) // 2
+        older, recent = statistics.mean(rates[:half]), statistics.mean(rates[half:])
+        if older > 0 and recent > 1.25 * older:
+            f.trend = "rising"
+        elif older > 0 and recent < 0.8 * older:
+            f.trend = "falling"
+        else:
+            f.trend = "steady"
 
     # ── when / how likely is the next use? ──────────────────────────────────
     last = uses[-1][0]
@@ -156,20 +193,19 @@ def forecast(ing: Ingredient, today: Optional[date] = None, horizon: int = 7,
         f.advice = "Out of stock"
     elif f.inactive:
         f.advice = "Possibly inactive"
+    elif f.stock <= f.reorder_point:
+        f.advice = "Reorder now"
+    elif f.days_left is not None and f.days_left <= 2 * lead:
+        f.advice = "Reorder soon"
     else:
-        soonest = f.days_left_early if f.days_left_early is not None else f.days_left
-        if soonest is not None and soonest <= lead:
-            f.advice = "Reorder now"
-        elif f.days_left is not None and f.days_left <= 2 * lead:
-            f.advice = "Reorder soon"
-        else:
-            f.advice = "OK"
+        f.advice = "OK"
     return f
 
 
-def forecast_all(ings, today=None, horizon=7, lead=5, sort="Next use") -> list:
+def forecast_all(ings, today=None, horizon=7, lead=5, sort="Next use",
+                 cover=14) -> list:
     today = today or date.today()
-    results = [forecast(i, today, horizon, lead) for i in ings]
+    results = [forecast(i, today, horizon, lead, cover) for i in ings]
     far = date.max
     keys = {
         "Next use": lambda f: (f.next_use is None, f.next_use or far, -(f.chance or 0)),
@@ -258,9 +294,20 @@ def describe(f: Forecast, today: date, lead: int) -> str:
             else:
                 rng = f"{fmt_date(early, today)} to {fmt_date(late, today) if late else 'much later'}"
                 out.append(f"  likely range: {rng}")
-            reorder = early - timedelta(days=lead)
-            when = "now" if reorder <= today else fmt_date(reorder, today)
-            out.append(f"  reorder by: {when}  ({lead}-day lead time)")
+            pass
+    if f.reorder_point is not None and f.stock > 0:
+        out += ["", f"Replenishment  ({f.lead}-day lead time, {f.cover}-day cover)"]
+        out.append(f"  safety stock: {f.safety_stock:.3g}{unit}")
+        out.append(f"  reorder point: {f.reorder_point:.3g}{unit}")
+        if f.stock <= f.reorder_point:
+            out.append(f"  stock is at or below the reorder point - order about "
+                       f"{f.order_qty:g}{unit} now")
+        elif f.rate:
+            days_to_rop = int((f.stock - f.reorder_point) / f.rate)
+            when = today + timedelta(days=days_to_rop)
+            out.append(f"  reorder by: {fmt_date(when, today)} ({relative(when, today)})")
+        if f.trend:
+            out.append(f"  consumption trend: {f.trend}")
     reason = {"low": "few usage records", "medium": "a fair amount of history",
               "high": "plenty of history"}[f.confidence]
     out += ["", f"Confidence: {f.confidence} ({reason}). Based on current stock only; "
@@ -298,11 +345,13 @@ def build_projection_figure(f: Forecast, today: date, lead: int) -> Figure:
             xn = num(f.next_use)
             ax.plot([xn], [max(f.stock - f.rate * (xn - t0), 0.0)], "v",
                     color=THEME["palette"][3], markersize=8, label="Next use")
-        if f.days_left_early is not None:
-            reorder = t0 + f.days_left_early - lead
-            if reorder > t0:
-                ax.axvline(reorder, color=THEME["palette"][2], linestyle="--",
-                           linewidth=1.2, label=f"Reorder by ({lead}d lead)")
+        if f.reorder_point:
+            ax.axhline(f.reorder_point, color=THEME["palette"][2], linestyle=":",
+                       linewidth=1.2, label="Reorder point")
+            to_rop = (f.stock - f.reorder_point) / f.rate
+            if to_rop > 0:
+                ax.axvline(t0 + to_rop, color=THEME["palette"][2], linestyle="--",
+                           linewidth=1.2, label="Reorder by")
     elif f.rate is None:
         ax.text(0.5, 0.5, "Not enough usage records to forecast",
                 transform=ax.transAxes, ha="center", va="center",

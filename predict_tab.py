@@ -7,9 +7,10 @@ reorder.  Select a row for the explanation and a forecast chart.
 """
 from __future__ import annotations
 
+import csv
 import tkinter as tk
 from datetime import date
-from tkinter import ttk
+from tkinter import filedialog, messagebox, ttk
 
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
@@ -65,6 +66,17 @@ class PredictionsTab(tk.Frame):
         spin.bind("<Return>", lambda _e: self.refresh())
         spin.bind("<FocusOut>", lambda _e: self.refresh())
 
+        label("Cover (days)")
+        self.cover_var = tk.StringVar(value="14")
+        cover = tk.Spinbox(bar, from_=1, to=180, width=4, textvariable=self.cover_var,
+                           command=self.refresh, bg=c["surface2"], fg=c["text"],
+                           buttonbackground=c["surface3"], insertbackground=c["accent"],
+                           relief="flat", font=(FONT, 10), highlightthickness=1,
+                           highlightbackground=c["border"])
+        cover.pack(side="left")
+        cover.bind("<Return>", lambda _e: self.refresh())
+        cover.bind("<FocusOut>", lambda _e: self.refresh())
+
         label("Sort by")
         self.sort_var = tk.StringVar(value=self.SORTS[0])
         s = ttk.Combobox(bar, textvariable=self.sort_var, state="readonly",
@@ -72,10 +84,12 @@ class PredictionsTab(tk.Frame):
         s.pack(side="left")
         s.bind("<<ComboboxSelected>>", lambda _e: self.refresh())
 
-        tk.Button(bar, text="⟳ Refresh", command=self.refresh, bg=c["surface2"],
-                  fg=c["text"], activebackground=c["surface3"],
-                  activeforeground=c["text"], relief="flat", bd=0, cursor="hand2",
-                  font=(FONT, 9, "bold"), padx=10, pady=5).pack(side="left", padx=12)
+        for text, cmd in (("⟳ Refresh", self.refresh),
+                          ("💾 Reorder list (CSV)", self._export)):
+            tk.Button(bar, text=text, command=cmd, bg=c["surface2"], fg=c["text"],
+                      activebackground=c["surface3"], activeforeground=c["text"],
+                      relief="flat", bd=0, cursor="hand2", font=(FONT, 9, "bold"),
+                      padx=10, pady=5).pack(side="left", padx=(12, 0))
 
         self.summary = tk.Label(self, text="", bg=c["bg"], fg=c["accent"],
                                 font=(FONT, 10, "bold"), anchor="w", justify="left",
@@ -92,13 +106,14 @@ class PredictionsTab(tk.Frame):
         # table
         top = tk.Frame(pane, bg=c["surface"])
         cols = ("ingredient", "stock", "rate", "next", "chance", "runout", "left",
-                "conf", "advice")
+                "rop", "order", "conf", "advice")
         self.tree = ttk.Treeview(top, columns=cols, show="headings", selectmode="browse")
-        spec = (("ingredient", "Ingredient", 150, "w"), ("stock", "In stock", 90, "e"),
-                ("rate", "Use / day", 85, "e"), ("next", "Next use", 170, "w"),
-                ("chance", "Chance", 70, "center"), ("runout", "Runs out", 110, "w"),
-                ("left", "Days left (range)", 120, "center"),
-                ("conf", "Confidence", 85, "center"), ("advice", "Advice", 130, "w"))
+        spec = (("ingredient", "Ingredient", 130, "w"), ("stock", "In stock", 85, "e"),
+                ("rate", "Use / day", 80, "e"), ("next", "Next use", 165, "w"),
+                ("chance", "Chance", 65, "center"), ("runout", "Runs out", 105, "w"),
+                ("left", "Days left (range)", 115, "center"),
+                ("rop", "Reorder at", 85, "e"), ("order", "Order qty", 85, "e"),
+                ("conf", "Confidence", 80, "center"), ("advice", "Advice", 115, "w"))
         for col, text, width, anchor in spec:
             self.tree.heading(col, text=text)
             self.tree.column(col, width=width, minwidth=60, anchor=anchor,
@@ -143,6 +158,12 @@ class PredictionsTab(tk.Frame):
         except ValueError:
             return 5
 
+    def _cover(self) -> int:
+        try:
+            return max(1, min(180, int(self.cover_var.get())))
+        except ValueError:
+            return 14
+
     def refresh(self):
         try:
             rows = self.get_rows()
@@ -155,7 +176,7 @@ class PredictionsTab(tk.Frame):
         lead = self._lead()
         ings = build_ingredients(rows)
         results = pred.forecast_all(list(ings.values()), self._today, horizon, lead,
-                                    self.sort_var.get())
+                                    self.sort_var.get(), self._cover())
         self._forecasts = {f.ingredient.key: f for f in results}
 
         previous = self.tree.selection()
@@ -186,7 +207,8 @@ class PredictionsTab(tk.Frame):
         ing = f.ingredient
         unit = f" {ing.unit}" if ing.unit else ""
         if f.rate is None:
-            return (ing.name, f"{f.stock:g}{unit}", "-", "-", "-", "-", "-", "-", f.advice)
+            return (ing.name, f"{f.stock:g}{unit}", "-", "-", "-", "-", "-", "-", "-",
+                    "-", f.advice)
         nxt = "-" if f.next_use is None else (
             f"{pred.fmt_date(f.next_use, t)} ({pred.relative(f.next_use, t)})")
         if f.days_left is None:
@@ -195,9 +217,11 @@ class PredictionsTab(tk.Frame):
             lo = f.days_left_early if f.days_left_early is not None else f.days_left
             hi = f"{f.days_left_late}" if f.days_left_late is not None else "+"
             left = f"{f.days_left} ({lo}-{hi})"
-        return (ing.name, f"{f.stock:g}{unit}", f"{f.rate:.3g}", nxt,
-                f"{f.chance:.0%}", pred.fmt_date(f.runout, t), left, f.confidence,
-                f.advice)
+        arrow = {"rising": " ↑", "falling": " ↓"}.get(f.trend, "")
+        order = f"{f.order_qty:g}{unit}" if f.order_qty else "-"
+        return (ing.name, f"{f.stock:g}{unit}", f"{f.rate:.3g}{arrow}", nxt,
+                f"{f.chance:.0%}", pred.fmt_date(f.runout, t), left,
+                f"{f.reorder_point:.3g}{unit}", order, f.confidence, f.advice)
 
     def _summarise(self, results, horizon):
         ranked = [f for f in results if f.chance is not None and not f.inactive]
@@ -213,6 +237,32 @@ class PredictionsTab(tk.Frame):
             parts.append("Not enough usage history yet - record what you use "
                          "(e.g. \"used 2 kg rice\") and predictions will appear here.")
         self.summary.configure(text="   |   ".join(parts), fg=self.c["accent"])
+
+    def _export(self):
+        """Save the items that need ordering (plus everything's reorder point)."""
+        if not self._forecasts:
+            messagebox.showinfo("Reorder list", "Nothing to export yet.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv", filetypes=[("CSV file", "*.csv")],
+            initialfile="stockllama_reorder_list.csv")
+        if not path:
+            return
+        t = self._today
+        urgent = ("Out of stock", "Reorder now", "Reorder soon")
+        rows = [f for f in self._forecasts.values() if f.advice in urgent]
+        with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+            w = csv.writer(fh)
+            w.writerow(["ingredient", "unit", "in_stock", "avg_daily_use", "reorder_point",
+                        "suggested_order_qty", "runs_out", "advice", "confidence"])
+            for f in rows:
+                w.writerow([f.ingredient.name, f.ingredient.unit, f"{f.stock:g}",
+                            "" if f.rate is None else f"{f.rate:.3g}",
+                            "" if f.reorder_point is None else f"{f.reorder_point:.3g}",
+                            "" if f.order_qty is None else f"{f.order_qty:g}",
+                            "" if f.runout is None else f.runout.isoformat(),
+                            f.advice, f.confidence])
+        messagebox.showinfo("Reorder list", f"Saved {len(rows)} item(s) that need ordering.")
 
     # ── selection ─────────────────────────────────────────────────────────
     def _on_select(self, _event):

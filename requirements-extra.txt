@@ -1,14 +1,20 @@
-# Charts (required for the Charts tab)
+# Already needed by the base project (listed here for completeness)
+psycopg2-binary
+requests
+
+# Charts and predictions
 matplotlib>=3.7
 numpy
 
-# Voice input - microphone capture (required for the record button)
+# Voice input - microphone capture (the 🎙 button)
 sounddevice
+# On Linux the audio library may also need:  sudo apt install libportaudio2
 
 # Voice input - pick the backend(s) you want:
-# FUTO ACFT models from the Hugging Face Hub (futo-org/acft-whisper-*)
+# FUTO ACFT models from the Hugging Face Hub (futo-org/acft-whisper-*); also gives download progress
 transformers
 torch
+huggingface_hub
 # Stock Whisper sizes, fast on CPU
 faster-whisper
 # whisper.cpp .bin files (e.g. downloaded from keyboard.futo.org/voice-input-models)
